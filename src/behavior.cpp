@@ -28,7 +28,15 @@
 #include <wincrypt.h>
 
 #include "behavior.h"
+#include "criteria.h"
 #include "common.h"
+#include "sfcompat.h"
+// ★ 2026-10-02：FileIsSigned 需在"嵌入签名缺失"时回退**目录签名（.cat）**，
+//   复用 scanner.cpp 已实现并已验证的 SigTrustedCached（内含路径规范化 + 目录签名遍历）。
+//   依赖方向安全：scanner.h 只依赖标准库与 iocs.h，不反向依赖 behavior.h。
+#include "scanner.h"
+#include "aimodel.h"     // 2026-10-03 EDR 闭环：模型层接入判定（GlobalModelScore）
+#include "aifeat.h"      // 同上：FeatureInput / BuildFeatures（纯函数，无 I/O）
 
 #include <algorithm>
 #include <string>
@@ -54,6 +62,38 @@ static std::string Lower(std::string s) {
 static bool Has(const std::string& hay, const char* needle) {
     return hay.find(needle) != std::string::npos;
 }
+
+// ---------------------------------------------------------------------------
+//  HasWord —— 「带词边界」的子串匹配（2026-10-03 新增）
+// ---------------------------------------------------------------------------
+//  为什么需要它（真样本误报复盘，Win10 虚拟机实证）：
+//    规则 `nc -e` 误杀了微软已签名的同步中心 **mobsync.exe**（VM 里被终止两次）。
+//    根因不是「needle 太短」这么笼统，而是两条机制叠加：
+//      ① `lNoExe`（L938-952）构造了第二份匹配串 = 归一化串**去掉 .exe 后缀**；
+//      ② 纯子串匹配**没有任何词边界**。
+//    于是 `mobsync.exe -e x`：
+//      原始 l    = `c:\...\system32\mobsync.exe -e x`   → 不含 `nc -e`
+//      去 exe 后 = `c:\...\system32\mobsync -e x`      → **命中** `nc -e`
+//    （`mobsync` 末尾的 `nc` + 空格 + `-e` 恰好拼出 needle）
+//
+//  ★ 踩过的坑（别再走一遍）：**把 needle 改长解决不了**。
+//    改成 `nc.exe -e` 之后 `mobsync` 依然命中 —— 因为该 needle 里的 `.` 在
+//    子串匹配里只是**普通字符**，而 `lNoExe` 又会把 `nc.exe` 还原回 `nc`，
+//    两边一对就又拼上了。**靠加长 needle 表达「必须是 netcat」是行不通的**，
+//    只能靠词边界。
+//
+//  判据：needle 首字符是「程序名首字母」时，要求其**前一个字符是分隔符**
+//        （空格 / 反斜杠 / 斜杠 / 串首）；needle 尾字符同理要求后接分隔符或串尾。
+//        分隔符集合刻意与 lNoExe 的后缀集合（L945）保持一致。
+//  ★ 只给**需要区分同形子串**的规则用（如 nc -e），不改变其它 108 条规则的行为。
+// ★ 2026-10-03（C3）：判据实现已抽到 criteria.cpp（生产与回归测试共用同一份）。
+//   抽出来的原因：本文件依赖十几个服务层符号（SigTrustedCached / LogDbg /
+//   BuildFeatures / GlobalModelScore / JsonGetInt / WriteFramed …），
+//   天生只能链进主服务 ⇒ 判据**无法被单测**。抽出去之后改判据可以跑回归，
+//   且测试跑的就是生产真正使用的那份实现（不是复刻版）。
+static bool IsCmdSep(char c)            { return sf::crit::IsCmdSep(c); }
+static bool HasWord(const std::string& h, const char* n) { return sf::crit::HasWord(h, n); }
+
 static bool InList(const std::string& v, const char* const* list, size_t n) {
     for (size_t i = 0; i < n; ++i) if (v == list[i]) return true;
     return false;
@@ -182,9 +222,11 @@ static const CmdRule kHardRules[] = {
     { "vbscript:",              1, 35, "script",  "vbscript: 协议执行脚本" },
 
     // ---- 隐藏窗口 / 规避察觉 ----
-    { "windowstyle hidden",     2, 50, "hidden",  "以隐藏窗口方式执行命令，规避用户察觉" },
+    // ★ 2026-09-22 降级：这两条原为 level=2（一票否决直接终止）。理由同 ps-encoded ——
+    //   Agent 工具链与守护进程普遍用隐藏窗口执行，不是恶意特征。降为 level=1 评分项。
+    { "windowstyle hidden",     1, 30, "hidden",  "以隐藏窗口方式执行命令（自动化工具亦普遍如此）" },
     { "windowstyle 1",          1, 25, "hidden",  "以隐藏窗口方式执行命令" },
-    { "w hidden",               2, 50, "hidden",  "以隐藏窗口方式执行命令" },
+    { "w hidden",               1, 30, "hidden",  "以隐藏窗口方式执行命令（自动化工具亦普遍如此）" },
 
     // ---- 勒索 / 反取证 ----
     { "vssadmin delete shadows", 2, 80, "ransom", "删除卷影副本（勒索行为，明确恶意）" },
@@ -206,11 +248,32 @@ static const CmdRule kHardRules[] = {
     { "taskkill /f /im",        1, 25, "kill",    "强制结束进程（需结合目标判断）" },
 
     // ---- 关闭安全软件（火绒披露：银狐会遍历并强杀安全进程）----
-    { "360tray",                2, 60, "killsav", "针对 360 安全软件的进程操作（银狐常用手法）" },
-    { "huorong",                2, 60, "killsav", "针对火绒安全软件的进程操作（银狐常用手法）" },
-    { "defender",               1, 30, "killsav", "针对 Defender 的操作（需结合上下文）" },
-    { "securityhealth",         1, 30, "killsav", "针对 Windows 安全中心的操作" },
-    { "windefend",              1, 35, "killsav", "针对 Windows Defender 服务的操作" },
+    // ★★ 2026-09-24 触发条件优化（银泊要求「优化而非删除」）
+    //
+    //  旧判据是**裸词**：{ "huorong", 2 } —— 只要命令行/映像路径**出现**该词就一票否决。
+    //  它同时朝着两个方向失效：
+    //    · 误报：安全软件**自身进程**的路径就含这些词（C:\Program Files\Huorong\… 、HipsTray.exe、
+    //            System32\SecurityHealthService.exe）→ 用户自己的杀软
+    //            被判「攻击安全软件」并被尝试终止；连命令行里只是**提到** defender
+    //            的正常程序（实测 WorkBuddy.exe）也被终止。
+    //    · 漏报：真实攻击形如 `taskkill /f /im HipsTray.exe`、`sc stop huorong`
+    //            —— 命令行里往往**不含** huorong 字样，裸词判据根本拦不住。
+    //
+    //  现改为「**破坏性动作 + 安全软件目标**」双条件（下表为常见组合的快速路径，
+    //  通用组合与"杀软自身豁免"由 HitKillSav() 覆盖）。这样误报归零、拦截率反升。
+    { "taskkill /f /im hips",    2, 65, "killsav", "强杀火绒主进程（银狐常用手法）" },
+    { "taskkill /f /im wsctrl",  2, 65, "killsav", "强杀火绒服务进程（银狐常用手法）" },
+    { "taskkill /f /im usysdiag",2, 65, "killsav", "强杀火绒内核进程（银狐常用手法）" },
+    { "taskkill /f /im 360",     2, 60, "killsav", "强杀 360 安全软件进程（银狐常用手法）" },
+    { "taskkill /f /im msmpeng", 2, 60, "killsav", "强杀 Defender 引擎进程" },
+    { "taskkill /f /im windefend",2,60, "killsav", "强杀 Defender 服务进程" },
+    { "taskkill /f /im qqpcmgr", 2, 60, "killsav", "强杀腾讯电脑管家进程" },
+    { "sc stop huorong",         2, 60, "killsav", "停止火绒服务（关闭防护）" },
+    { "net stop huorong",        2, 60, "killsav", "停止火绒服务（关闭防护）" },
+    { "sc delete huorong",       2, 65, "killsav", "删除火绒服务（关闭防护）" },
+    { "sc stop windefend",       2, 60, "killsav", "停止 Defender 服务（关闭防护）" },
+    { "net stop windefend",      2, 60, "killsav", "停止 Defender 服务（关闭防护）" },
+    { "fltmc unload",            1, 40, "killsav", "卸载文件系统过滤驱动（关闭防护，需结合目标）" },
 
     // ---- 凭据窃取 ----
     { "lsass",                  2, 60, "cred",    "针对 lsass 进程的操作（凭据窃取）" },
@@ -223,9 +286,107 @@ static const CmdRule kHardRules[] = {
 // 例如原本带空格的 "netsh advfirewall set" 归一化后仍保留单空格（见 NormalizeCommandLine）。
 
 // ---------------------------------------------------------------------------
+//  关闭安全软件（killsav）通用判据 —— 与上表配合使用（2026-09-24）
+//
+//  上表只列了最常见的「taskkill /f /im <杀软进程>」「sc stop <杀软服务>」组合；
+//  真实攻击的动词与目标组合很多（ntsd / fltmc unload / 卸载程序 / 删目录 / 改注册表…），
+//  这里做**通用覆盖**，并负责两件上表做不到的事：
+//    ① 只有「破坏性动词」与「安全软件目标名」**同时**出现才判 —— 光提到名字不算；
+//    ② **安全软件自身豁免** —— 进程映像路径本身落在杀软目录/进程名里时直接放行，
+//       彻底消除「火绒 HipsTray / Windows 安全中心被判攻击安全软件」这类自命中。
+// ---------------------------------------------------------------------------
+static const char* kSavTargets[] = {
+    // 火绒
+    "huorong", "hipsmain", "hipstray", "wsctrlsvc", "usysdiag", "sysdiag",
+    // 360 安全卫士 / 杀毒
+    "360tray", "360safe", "360sd", "360rp", "zhudongfangyu",
+    // Windows Defender / 安全中心
+    "windefend", "msmpeng", "securityhealth", "mpcmdrun", "nissrv",
+    // 其他常见安全软件
+    "qqpcmgr", "kxescore", "kingsoft", "baidusd", "avp.exe",
+    "avast", "avgnt", "nod32", "ekrn", "mcshield", "sophos",
+};
+
+//  ★★★ 2026-09-24 二次收紧：**只保留句法专一的破坏性命令**。
+//  首版把 "disable" / "wmic" / "reg add" / "reg delete" / "sc config" / "rmdir" 也列为动词，
+//  结果与 Electron/Chromium 命令行高频冲突 —— 它的每个子进程都带
+//  `--disable-gpu` `--disable-features=...`，只要同一行里再出现系统安全组件名
+//  （windefend / securityhealth / msmpeng / sysdiag）就误判（实测 WorkBuddy 被终止两次）。
+//  这些宽泛词已移除；剩余项都要求「动词 + 紧跟的目标」构成一条完整破坏命令，
+//  再叠加下方 HitKillSav 的**紧邻窗口**约束（见函数内注释）。
+static const char* kSavVerbs[] = {
+    "taskkill", "ntsd",                                   // 强杀进程
+    "sc stop", "sc delete",                               // 停止/删除服务
+    "net stop", "net.exe stop", "stop-service",           // 停止服务
+    "fltmc unload", "flt mc unload",                      // 卸载过滤驱动
+    "uninstall", "/uninstall", "unins000",                // 走卸载程序
+    "del /f", "rd /s",                                    // 删文件/目录
+};
+
+// 进程自身是否就是安全软件（路径或文件名含杀软标识）→ 是则豁免 killsav 判定
+static bool IsSelfSecurityProduct(const std::string& pathLower) {
+    if (pathLower.empty()) return false;
+    for (const char* t : kSavTargets) {
+        if (pathLower.find(t) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// 命中返回 true，并回填目标名与动词（用于生成可读理由）
+//
+//  ★★★ 2026-09-24 二次收紧：由「**全文共现**」改为「**同句紧邻**」。
+//  首版只要求动词与目标名在同一命令行里各自出现一次，实测过松 ——
+//  WorkBuddy（Electron）的每个子进程命令行都含 `--disable-gpu --disable-features=…`，
+//  一旦同行另处提到任一系统安全组件名，就被判「攻击安全软件」并终止（实测两次）。
+//  现要求：**目标名必须出现在动词之后 kVerbWindow 字符内**，即构成
+//  「taskkill /f /im HipsTray.exe」「sc stop huorong」这类完整破坏命令才算。
+//  同时保留「杀软自身豁免」（IsSelfSecurityProduct）。
+static const size_t kVerbWindow = 64;
+
+static bool HitKillSav(const std::string& l, const std::string& lNoExe,
+                       const std::string& selfPathLower,
+                       std::string& outTarget, std::string& outVerb) {
+    if (IsSelfSecurityProduct(selfPathLower)) return false;   // ★ 杀软自身 → 豁免
+
+    const std::string* texts[2] = { &l, &lNoExe };
+    for (const std::string* txt : texts) {
+        for (const char* vb : kSavVerbs) {
+            const size_t vl = std::strlen(vb);
+            size_t p = txt->find(vb);
+            while (p != std::string::npos) {
+                // 双向窗口：目标名允许出现在动词**前或后** kVerbWindow 字符内。
+                // 为什么必须双向：路径式调用把目标写在动词之前，例如
+                //   "C:\Program Files\Huorong\uninst.exe" /uninstall
+                // —— 只看动词之后会漏拦（实测 B6 用例）。宽泛动词已移除，
+                // 双向不会与 Electron 的 --disable-* 之类冲突。
+                const size_t from = (p > kVerbWindow) ? (p - kVerbWindow) : 0;
+                const std::string win = txt->substr(from, (p - from) + vl + kVerbWindow);
+                for (const char* t : kSavTargets) {
+                    if (win.find(t) != std::string::npos) {
+                        outTarget = t; outVerb = vb;
+                        return true;
+                    }
+                }
+                p = txt->find(vb, p + 1);
+            }
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 //  规则外置化存储（热更新）
 // ---------------------------------------------------------------------------
-struct ExtRule { std::string needle; int level; int score; std::string tag, reason; };
+struct ExtRule {
+    std::string needle;
+    int         level  = 0;
+    int         score  = 0;
+    std::string tag;
+    std::string reason;
+    // ★ true = 匹配时要求词边界（见 HasWord）。用于「程序名 + 参数」类 needle：
+    //   纯子串匹配会把 `mobsync` 命中成 `nc -e`（详见 behavior_rules.txt 的收紧原则）。
+    bool        wordBoundary = false;
+};
 static std::vector<ExtRule>      g_extRules;
 static std::vector<std::string>  g_whiteParents;
 static std::mutex                g_ruleMutex;
@@ -295,14 +456,25 @@ bool LoadExternalRules(const std::string& filePath) {
         std::string kind = Lower(f2[0]);
         if (kind == "w" && f2.size() >= 2) {
             whites.push_back(Lower(f2[1]));
-        } else if (kind == "h" && f2.size() >= 5) {
-            // H|level|tag|needle|reason  —— 硬规则，分数由 level 反推
+        } else if ((kind == "h" || kind == "h~") && f2.size() >= 5) {
+            // H|level|tag|needle|reason   —— 硬规则，分数由 level 反推，纯子串匹配
+            // H~|level|tag|needle|reason  —— 硬规则 + **要求词边界**（2026-10-03 新增）
+            //
+            // 为什么要 `~` 这个变体（真样本误报复盘）：
+            //   规则 `nc -e` 误杀微软已签名的 **mobsync.exe**。
+            //   根因是 lNoExe（去 .exe 后缀）把 `mobsync.exe -e` 变成 `mobsync -e`，
+            //   而 `mobsync` 末尾的 `nc` + 空格 + `-e` **恰好拼出 `nc -e`**。
+            //   ⇒ 「加长 needle」解决不了（`nc.exe -e` 同样会被 lNoExe 还原回 `nc`），
+            //     **只能靠词边界**：要求 needle 前后必须是分隔符或串首/串尾。
+            //   用法：只给**存在同形子串风险**的规则加，其余保持 `H|` 原样不动
+            //        （避免影响其它 100+ 条规则的既有行为）。
             ExtRule r;
             r.level  = atoi(f2[1].c_str());
             r.tag    = f2[2];
             r.needle = Lower(f2[3]);
             r.reason = f2[4];
             r.score  = (r.level >= 2) ? 60 : 35;
+            r.wordBoundary = (kind == "h~");
             rules.push_back(r);
         } else if (kind == "s" && f2.size() >= 5) {
             // S|weight|tag|needle|reason —— 评分项，weight 直接作分数
@@ -478,6 +650,37 @@ bool FileIsSigned(const std::string& path, std::string* outSignerName) {
         }
     }
 
+    // ★★ 2026-10-02 修复（这是**第二条**独立的误报路径，与 scanner.cpp 的前缀比较那条不同）
+    //
+    //  症状：微软正版系统服务被判「白加黑侧加载劫持（档2 铁证）」并送检 + 锁原件。
+    //        日志实证：`[sideload] 铁证 dll=…\uxtheme.dll host=msra.exe`、
+    //        `[sideload] 铁证 …esent.dll host=TieringEngineService.exe`。
+    //
+    //  原因（两层叠加，缺一不可）：
+    //    ① 本函数以前**只查嵌入式签名** —— CryptQueryObject + PKCS7_SIGNED_EMBED。
+    //       而微软的系统 DLL（uxtheme.dll / esent.dll / comctl32.dll / dbghelp.dll …）
+    //       **只有目录签名（.cat），没有嵌入签名** → 这里一律判"无签名"。
+    //    ② sideload::Find 在 System32 里的系统 exe 上出现"自指"：
+    //       被测 exe 在 System32 → dir = System32 → 它导入的 uxtheme.dll 也解析到
+    //       System32\uxtheme.dll，于是 cand 与"系统同名 DLL"**是同一个文件**。
+    //       ①说它"无签名"、②说"系统已提供同名却有无签名副本" → 判「档2 铁证劫持」。
+    //
+    //  修法：嵌入签名缺失时回退到 SigTrustedCached（复用 scanner.cpp 的
+    //        HasValidSignature，其中含**目录签名**验证与路径规范化）。
+    //
+    //  **能力绝不减**：攻击者塞进来的假冒 DLL，其哈希不在微软签名的 .cat 里，
+    //  目录签名同样验不过 → 仍判"无签名" → 该报的照报（见 HasCatalogSignature ③）。
+    //  这里只是把"微软自己的系统 DLL"从"无签名"里摘出来。
+    //
+    //  注：sideload.cpp 那处"同一文件自指"的语义问题**刻意不单独修** ——
+    //      若在那边加一句"cand 落在系统目录就跳过"，会连"System32 里的 DLL 被
+    //      替换成恶意版本"这种形态一起放过（那是真实攻击，不该放过）。
+    //      根因是签名判定，就在这里修；修好之后自指那条分支自然不再触发。
+    if (!signedOk && SigTrustedCached(path)) {
+        signedOk = true;
+        if (signer.empty()) signer = "（目录签名 / catalog）";
+    }
+
     {
         std::lock_guard<std::mutex> lk(g_signMutex);
         if (g_signCache.size() > 8192) g_signCache.clear();
@@ -522,7 +725,29 @@ bool ProcReputable(const std::string& exePath) {
         "amd", "intel", "apple", "adobe", "tencent", "netease", "bilibili",
         "kingsoft", "qihoo", "huorong", "huawei", "lenovo", "alibaba",
         "baidu", "bytedance", "douyin", "wps", "python software", "github",
-        "kaspersky", "eset", "bitdefender", "avast", "avg"
+        "kaspersky", "eset", "bitdefender", "avast", "avg",
+        // ---- ★ 反作弊 / 游戏厂商（2026-09-20 新增，防空杀反作弊）----
+        // 依据：这些厂商的组件普遍带有效签名，且常以「服务 + 内核驱动 + 随机名伴随模块」
+        // 形态常驻（Vanguard 开机自启、EAC 随游戏加载），行为画像与银狐高度相似
+        // （自启、注入其它进程、写驱动、提权），极易被误拦。
+        // 签名者名称按各家实际 Authenticode 主体填写，同时补产品名（不同版本签名主体不一）。
+        "easy anti-cheat", "easyanticheat", "epic games", "kamucli",
+        "battleye", "battleye gmbh",
+        "riot games", "riot vanguard",
+        "wellbia", "xigncode", "wemade", "inca internet",
+        "nprotect", "inca",
+        "faceit", "esl", "esea",
+        "electronic arts", "ea games",
+        "ubisoft", "rockstar", "take-two",
+        "activision", "blizzard", "battle.net",
+        "garena", "krafton", "nexon", "ncsoft", "smilegate", "pearl abyss",
+        "bandai namco", "square enix", "capcom", "sega", "konami",
+        "perfect world", "mihoyo", "hoyoverse", "cognosphere", "kuro game", "hypergryph",
+        "ant group", "antgroup",           // ACE 反作弊（腾讯 ACE / 阿里系）
+        "gameanticheat", "anticheatexpert",
+        "wargaming", "gaijin", "digital extremes", "grinding gear",
+        "cd projekt", "paradox interactive", "bohemia interactive",
+        "unity technologies", "epic",
     };
     std::string low = signer;
     for (auto& c : low) c = (char)tolower((unsigned char)c);
@@ -679,9 +904,17 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
     if (ps) {
         if (Has(l, "-encodedcommand") || Has(l, "-enc ") || Has(l, "-e ") ||
             Has(l, " /enc ") || Has(l, " /encodedcommand")) {
-            v.level = 2; v.score = 70; v.hard = true; v.tag = "ps-encoded";
-            v.reason = "PowerShell 编码命令（-EncodedCommand），免杀常用手法，正常脚本不会这么写";
-            return v;
+            // ★ 2026-09-22 降级：原为 hard=true/score=70（一票否决直接终止）。
+            //   降级理由：这是**唯一的二元身份判据**，而 AI Agent（WorkBuddy/OpenClaw
+            //   等）把命令 base64 打包是工具链常态，不是免杀。若保留 hard，等于
+            //   对所有 Agent 办公程序一票判死。
+            //   为什么不加白名单豁免：白名单靠名字/路径，攻击者改名换目录即可绕过，
+            //   开源项目更是把绕过方法直接公开。改评分权重则对所有进程一视同仁 ——
+            //   攻击者伪装成 Agent 拿不到任何额外好处。
+            //   安全强度由组合信号补回：本项 45 分 + 外联/下载/落文件叠加仍会过阈值。
+            v.level = (v.level < 1) ? 1 : v.level; v.score += 45; v.tag = "ps-encoded";
+            v.reason = "PowerShell 以 -EncodedCommand 执行编码命令（免杀常用手法，"
+                       "但自动化工具链也普遍如此，需结合是否有网络外联与落地文件判断）";
         }
         // -nop / -w hidden / -ep bypass 三件套组合 = 典型的攻击用法
         int combo = (Has(l, "-nop") || Has(l, "-noprofile") ? 1 : 0)
@@ -689,24 +922,40 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
                   + (Has(l, "-ep bypass") || Has(l, "-executionpolicy bypass") ||
                      Has(l, "bypass") ? 1 : 0);
         if (combo >= 2) {
-            v.level = 2; v.score = 60; v.hard = true; v.tag = "ps-bypass";
+            // ★ 2026-09-22 降级：原 hard=true/score=60。理由同 ps-encoded ——
+            //   Agent 工具链普遍带 -nop/-w hidden/bypass（非交互式执行必需品）。
+            // ★ 2026-09-24 降权 40 → 10：`-ExecutionPolicy Bypass` 在正常安装脚本、
+            //   自动化工具、Agent 里都极常见，属**弱旁证**而非独立证据（银泊 09-24 反馈：
+            //   开机时 powershell 被误判终止）。真正的高危是「绕过 + 远程载荷/编码命令」——
+            //   那由 ps-encoded(45) 与 downloadstring/iex 等硬规则各自拿下，底线不降。
+            v.level = (v.level < 1) ? 1 : v.level; v.score += 10; v.tag = "ps-bypass";
             v.reason = "PowerShell 以「无配置 + 隐藏窗口 + 绕过执行策略」组合启动，"
-                       "这是恶意脚本的标准启动参数，正常管理脚本不会这么嵌套使用";
-            return v;
+                       "恶意脚本标准参数，但自动化工具链亦普遍如此，需结合外联判断";
         }
         if (Has(l, "-nop") && Has(l, "-c ")) {
-            v.level = 1; v.score = 35; v.tag = "ps-nop";
-            v.reason = "PowerShell 以 -NoProfile -Command 执行，常见于自动化脚本，需结合内容判断";
+            // ★ 2026-09-22 修 bug：原为 `v.score = 35`（**赋值**），会把上面
+            //   ps-encoded 已累加的 45 分整个覆盖成 35 —— 命中越多分反而越低。
+            //   正解：累加，且仅在尚未被 ps-bypass 计过时补计（避免重复）。
+            if (v.tag != "ps-bypass") {
+                v.level = (v.level < 1) ? 1 : v.level;
+                v.score += 5; v.tag = "ps-nop";    // 20 → 5：`-nop` 只是弱旁证
+                v.reason = "PowerShell 以 -NoProfile -Command 执行，"
+                           "常见于自动化脚本，需结合内容判断";
+            }
         }
     }
 
     // ---- 隐藏窗口（通用，不只 PS）----
+    // ★ 2026-09-22：注意 ps-bypass 的 combo 判据**已包含 `-w hidden`** ——
+    //   若此处再独立加一次，同一子串会被计两次（实测 40+30=70 判高危，
+    //   而它只是 Agent 的标准非交互启动参数）。故 combo 命中后本段跳过。
     if (host && (Has(l, "windowstyle hidden") || Has(l, "w hidden") || Has(l, "-hidden"))) {
-        if (v.level < 2) {
-            v.level = 2; v.score = 55; v.hard = true; v.tag = "hidden";
-            v.reason = "以隐藏窗口方式执行命令，典型规避用户察觉的手法";
+        if (v.level < 2 && v.tag != "ps-bypass") {
+            // ★ 2026-09-22 降级：原 hard=true/score=55。
+            v.level = 1; v.score += 12; v.tag = "hidden";   // 30 → 12：隐藏窗口是弱旁证
+            v.reason = "以隐藏窗口方式执行命令（规避用户察觉的常见手法，"
+                       "但守护进程/自动化任务也普遍如此，需结合外联判断）";
         }
-        return v;
     }
 
     // ---- rundll32 加载【系统目录之外】的 DLL ----
@@ -736,8 +985,40 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
     }
 
     // ---- 表驱动硬规则 ----
+    // ★ 2026-09-22 修漏报（回归测试抓出）：规则串写的是 `vssadmin delete shadows`，
+    //   但真实银狐常用**完整路径**调用（`C:\Windows\System32\vssadmin.exe delete shadows`），
+    //   归一化后中间夹着 `.exe` —— 子串匹配不上，勒索动作直接漏过。
+    //   正解：额外构造一份「去掉 .exe 后缀」的归一化串参与匹配。
+    //   注意：只用于**规则匹配**，不改 `l` 本身（其它判据依赖原始形态）。
+    std::string lNoExe;
+    {
+        lNoExe.reserve(l.size());
+        for (size_t i = 0; i < l.size(); ) {
+            // 命中 ".exe" 且后面是分隔符（空格/引号已归一化掉）或串尾 → 跳过这 4 字节
+            if (i + 4 <= l.size() &&
+                l[i] == '.' && l[i+1] == 'e' && l[i+2] == 'x' && l[i+3] == 'e' &&
+                (i + 4 == l.size() || l[i+4] == ' ' || l[i+4] == '\\' || l[i+4] == '/')) {
+                i += 4;
+                continue;
+            }
+            lNoExe += l[i];
+            ++i;
+        }
+    }
+    // ---- 关闭安全软件：通用「动作 + 目标」判据（2026-09-24，先于规则表执行）----
+    {
+        std::string selfLow = Lower(imagePath);        // 用于「杀软自身豁免」（本函数形参）
+        std::string tgt, vrb;
+        if (HitKillSav(l, lNoExe, selfLow, tgt, vrb)) {
+            v.level = 2; v.score = 70; v.hard = true; v.tag = "killsav";
+            v.reason = "针对安全软件的破坏性操作（" + vrb + " → " + tgt +
+                       "），银狐关闭防护的常用手法";
+            return v;
+        }
+    }
+
     for (const auto& r : kHardRules) {
-        if (Has(l, r.needle)) {
+        if (Has(l, r.needle) || Has(lNoExe, r.needle)) {
             if (r.level >= 2) {
                 v.level = 2; v.score = r.score; v.tag = r.tag; v.reason = r.reason; v.hard = true;
                 return v;
@@ -752,7 +1033,13 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
     {
         std::lock_guard<std::mutex> lk(g_ruleMutex);
         for (const auto& r : g_extRules) {
-            if (l.find(r.needle) != std::string::npos) {
+            // ★ 2026-10-03：`wordBoundary` 的规则走 HasWord（要求 needle 前后是分隔符），
+            //   其余仍走原来的纯子串 find —— **不改变其它 100+ 条规则的既有行为**。
+            const bool matched = r.wordBoundary
+                ? (HasWord(l, r.needle.c_str()) || HasWord(lNoExe, r.needle.c_str()))
+                : (l.find(r.needle) != std::string::npos ||
+                   lNoExe.find(r.needle) != std::string::npos);
+            if (matched) {
                 if (r.level >= 2) {
                     v.level = 2; v.score = r.score ? r.score : 60; v.tag = r.tag;
                     v.reason = r.reason; v.hard = true;
@@ -768,10 +1055,87 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
     }
 
     // ---- 脚本宿主 + 远程 URL → 升级（Defender 无文件检测思路）----
+    // ★★ 2026-09-23 收紧：修「WorkBuddy 被误杀」（银泊的 IDE 被本规则终止）
+    //
+    //  原判据「解释器字样 + 任意 URL」过于宽松 —— 实测命中场景：
+    //    WorkBuddy.exe … --permission-mode fullAccess --allowedTools powershell,bash …
+    //  命令行里只是**工具名列表提到 powershell** + 一个正常配置 URL，
+    //  就被判 host-url 硬拦并 TerminateProcess。
+    //
+    //  真正的「脚本宿主执行远程载荷」必须满足其一：
+    //    ① 宿主是 mshta / wscript / cscript / rundll32 / regsvr32
+    //       —— 这些程序的用途就是执行文件/URL，出现 URL 即异常；
+    //    ② URL 指向**可执行载荷**（.ps1/.vbs/.hta/.exe/… 且为 URL 结尾）。
+    //
+    //  安全底线不变：若 URL 内容被执行，必然伴随 downloadstring / iex /
+    //  frombase64string 等动作 —— 那些规则各自都是 level 2 硬拦，
+    //  所以「无扩展名 URL + 内存执行」依旧会被拿下，只是不再一刀切。
+    //
+    //  ★ 2026-09-22：这一条是方案一降级后安全底线的支点，**不要取消**，
+    //    只按上面两条收紧（判的是动作本身，与进程身份无关）。
+    const bool pureUrlHost = (lbase == "mshta.exe" || lbase == "wscript.exe" ||
+                              lbase == "cscript.exe" || lbase == "rundll32.exe" ||
+                              lbase == "regsvr32.exe");
     if (psOrScript && (Has(l, "http://") || Has(l, "https://") || Has(l, "ftp://"))) {
-        if (v.level < 2) {
-            v.level = 2; v.score = 60; v.hard = true; v.tag = "host-url";
-            v.reason = "脚本宿主直接执行远程 URL 内容，属于远程载荷执行";
+        // URL 结尾的载荷扩展名判断：必须紧跟 URL 终止符，避免
+        // `.json` 被 `.js` 命中、`.ps1xml` 之类误判。
+        static const char* kExts[] = { ".ps1", ".psm1", ".vbs", ".vbe", ".wsf", ".wsh",
+                                       ".hta", ".exe", ".dll", ".bat", ".cmd", ".scr",
+                                       ".msi", ".jar", ".jse", ".js", ".py", ".sh" };
+        bool urlIsPayload = false;
+        for (const char* ext : kExts) {
+            const size_t el = strlen(ext);
+            size_t p = 0;
+            while ((p = l.find(ext, p)) != std::string::npos) {
+                const size_t e = p + el;
+                const char c = (e < l.size()) ? l[e] : '\0';
+                if (c == '\0' || c == '"' || c == '\'' || c == ' ' || c == '?' ||
+                    c == '&' || c == ')' || c == '|' || c == '>' || c == '#' ||
+                    c == ';' || c == ',') { urlIsPayload = true; break; }
+                ++p;
+            }
+            if (urlIsPayload) break;
+        }
+        // ★ 第三条收紧（2026-09-23）：URL + 下载/执行动词（含 PowerShell 缩写）
+        //
+        //  为什么加：收紧前两条后实测露出一个缺口 ——
+        //    powershell -c "IEX (iwr https://evil/x)"      （无扩展名 URL）
+        //  判 0 分放行！因为规则库里写的是全称 invoke-expression / invoke-webrequest，
+        //  而银狐惯用缩写 `iex(iwr ...)`。故此处按「取回并执行」的组合语义兜底。
+        //
+        //  ⚠️ 必须用**词边界**匹配：`Has(l,"iex")` 会命中 `iexplore`（IE/浏览器命令行
+        //     天然含 URL）→ 把浏览器一网打尽。见下面的 hasWord lambda。
+        auto hasWord = [](const std::string& s, const char* w) {
+            const size_t wl = strlen(w);
+            size_t p = 0;
+            while ((p = s.find(w, p)) != std::string::npos) {
+                const bool leftOk  = (p == 0) ||
+                                     !isalnum((unsigned char)s[p - 1]);
+                const size_t e = p + wl;
+                const bool rightOk = (e >= s.size()) ||
+                                     !isalnum((unsigned char)s[e]);
+                if (leftOk && rightOk) return true;
+                ++p;
+            }
+            return false;
+        };
+        //  ★ 只认「取回并**执行**」的动词 —— 取回本身是正常行为（下载文件、调 API）。
+        //    实测教训：把 invoke-restmethod / iwr / curl 也算进来时，
+        //    `powershell -c "Invoke-RestMethod https://api.github.com/…"` 被判 host-url
+        //    硬拦 —— 而它是最常见的正常 API 调用形态，属于自己造误报。
+        //    银狐的真实形态是 `iex(iwr …)` / `IEX(irm …)`：执行动词在，
+        //    所以只留「执行」与「下载到内存」两类。
+        //    （curl/wget/certutil/start-bitstransfer 这类"取回/传输"动作另有
+        //      独立规则覆盖，不在这里重复。）
+        const bool hasExecVerb =
+            hasWord(l, "iex") ||
+            Has(l, "invoke-expression") ||
+            Has(l, "downloadstring") || Has(l, "downloadfile") ||
+            Has(l, "downloaddata");
+
+        if (pureUrlHost || urlIsPayload || hasExecVerb) {
+            v.level = 2; v.score = 75; v.hard = true; v.tag = "host-url";
+            v.reason = "脚本宿主直接执行远程 URL 内容，属于远程载荷执行（无文件攻击典型形态）";
         }
     }
 
@@ -780,18 +1144,43 @@ ProcVerdict JudgeCommandLine(const std::string& commandLine, const std::string& 
     //    这俩在子串匹配下是**同一个信号**（`C:\Temp\` 两个都命中），等于路径里
     //    出现一个临时目录就白拿 20 分。实测把 C:\Temp\ 下的正常程序判到 30 分
     //    → 误报。正解：一个语义信号只写一条，并优先用带路径分隔符的形式。
-    if (v.level < 2) {
-        if (Has(l, "-nop") || Has(l, "noprofile"))  v.score += 10;
-        if (Has(l, "encoded"))                      v.score += 10;
-        if (Has(l, "hidden"))                       v.score += 15;
-        if (Has(l, "bypass"))                       v.score += 15;
-        if (Has(l, "\\temp\\") || Has(l, "\\tmp\\")) v.score += 10;  // 从临时目录执行
-        if (Has(l, "\\appdata\\"))                  v.score += 10;
-        if (Has(l, "\\public\\"))                   v.score += 10;
-        if (Has(l, "http://") || Has(l, "https://")) v.score += 10;
-        if (Has(l, "base64"))                       v.score += 15;
-        if (Has(l, ".txt"))                         v.score += 5;   // 从文本文件读指令
-        if (Has(l, "\\programdata\\"))              v.score += 10;
+    //
+    // ⚠️ 二次踩坑（2026-09-22）：原守卫是 `if (v.level < 2)`，但上面 ps-encoded
+    //    降级后只把 level 设为 1，本区仍会执行 —— 于是 `encoded` 又加 10 分，
+    //    与 ps-encoded 的 45 分重复计分。正解：改用**独立标志**判断是否已计过，
+    //    而不是拿 level 当守卫（level 现在是「当前最高档」，不再是「是否已命中」）。
+    {
+        // 仅当上方未给出硬结论时才累加（hard 已在 host-url 处 return 语义）
+        if (!v.hard) {
+            // ⚠️ 三次踩坑（2026-09-22）：互斥判断最初只挡了 encoded / hidden，
+            //    结果 `-nop -w hidden -ep bypass` 这种**一次启动参数**被拆成
+            //    ps-bypass(40) + hidden(30) + bypass(15) + nop(10) = 95 分判高危 ——
+            //    而它正是 Agent / 守护进程的标准启动组合。
+            //    正解：**按 tag 整体互斥** —— 同一语义簇（PS 启动参数）只取其
+            //    最高一项，不再逐个子串重复累加。
+            const bool alreadyPsFamily = (v.tag == "ps-encoded" ||
+                                          v.tag == "ps-bypass"  ||
+                                          v.tag == "ps-nop");
+            const bool alreadyHidden  = (v.tag == "hidden");
+            // PS 启动参数簇：已有 ps-* 命中则整簇跳过（避免自我重复计分）
+            if (!alreadyPsFamily) {
+                if (Has(l, "-nop") || Has(l, "noprofile"))  v.score += 10;
+                if (Has(l, "-ep bypass") || Has(l, "executionpolicy bypass") ||
+                    Has(l, "bypass"))                       v.score += 15;
+                if (Has(l, "-w hidden") || Has(l, "windowstyle hidden")) v.score += 10;
+            }
+            // 隐藏窗口：hidden 标签已计则跳过
+            if (!alreadyHidden && !alreadyPsFamily &&
+                (Has(l, "hidden") || Has(l, "-hidden")))    v.score += 15;
+            // ---- 与 PS 启动参数无关的独立信号（正常累加）----
+            if (Has(l, "\\temp\\") || Has(l, "\\tmp\\"))    v.score += 10;
+            if (Has(l, "\\appdata\\"))                      v.score += 10;
+            if (Has(l, "\\public\\"))                       v.score += 10;
+            if (Has(l, "http://") || Has(l, "https://"))    v.score += 10;
+            if (Has(l, "base64"))                           v.score += 15;
+            if (Has(l, ".txt"))                             v.score += 5;
+            if (Has(l, "\\programdata\\"))                  v.score += 10;
+        }
     }
 
     // ---- 评分层定档（关键：单独判定命令行时也必须定档，否则全体漏报）----
@@ -810,8 +1199,66 @@ static ProcVerdict JudgeImagePath(const std::string& imagePath) {
 
     // 伪装系统进程：系统名出现在非系统目录
     if (IN_LIST(base, kSystemNames)) {
+        // ★ 2026-10-03 修正（Win10 虚拟机实测误杀 Defender 组件 ×2）：
+        //   原判据只认 `\windows\` 及其子目录，而 Defender 组件的真实安装路径是
+        //   `C:\Program Files\Windows Defender\NisSrv.exe`
+        //   —— 注意 `\Windows ` **带空格** ⇒ **不匹配 `\windows\`** ⇒ inSystem=false
+        //      ⇒ 必判 masquerade（level=2 / hard=true）。
+        //   实证：VM 日志 22:04:18 / 22:10:40 两条 `高 [masquerade]`。
+        //
+        //   ★★★ 两次踩坑的教训（**放宽判据比收紧更危险**）：
+        //     坑一：直接查 kTrustedDirs —— 它含 `\program files\`，
+        //           等于「任何放进 Program Files 的 svchost 都不算伪装」，
+        //           而那**恰是 masquerade 要抓的形态**。
+        //     坑二：把整个 Defender 目录当 inSystem —— 同样过宽，
+        //           `C:\Program Files\Windows Defender\svchost.exe`（假的）会被放过。
+        //     ⇒ **正解：按「目录 + 文件名」双条件精确豁免**，
+        //       目录只是必要条件，文件名仍必须在 kSystemNames 名单里（这已是前提）。
+        //   ⇒ 另一个方向也要防：`...\Windows Defender\NisSrv.exe.exe`（多一个 .exe）
+        //     不在名单里 ⇒ 仍应判伪装 ⇒ 目录豁免**不能**按前缀放行。
         bool inSystem = Has(l, "\\windows\\system32\\") || Has(l, "\\windows\\syswow64\\") ||
                         Has(l, "\\windows\\winsxs\\") || Has(l, "\\windows\\");
+        // 微软安全组件的真实安装目录（Windows 8 起固定在 Program Files 下，目录名带空格）。
+        //
+        // ★★★★ 这里连踩三次坑，**放宽判据比收紧更危险**，第四次才做对。留作教训：
+        //   坑一：查 kTrustedDirs —— 它含 `\program files\`，
+        //         等于「任何放进 Program Files 的 svchost 都不算伪装」，
+        //         而那恰是 masquerade 要抓的形态。
+        //   坑二：把整个 Defender 目录当 inSystem —— 同样过宽，
+        //         `...\Windows Defender\svchost.exe`（假的）会被放过。
+        //   坑三：用 `l.compare(0, dn, d) == 0` 从串首比 —— 但 `l` 是完整路径
+        //         `c:\program files\...`，前面还隔着盘符 ⇒ **永远不等**，
+        //         结果真阳性一起丢（Defender 组件仍被判伪装）。
+        //   坑四（本次自测抓到）：只校验「目录之后没有子目录」——
+        //         `...\Windows Defender\svchost.exe` 同样满足，但**svchost 根本不是
+        //         Defender 的组件**，放在那儿就是冒名顶替。
+        //
+        // ⇒ 正解：**按组件名单豁免，不按目录豁免**。
+        //   目录只是「候选」信号，真正放行要**文件名在该目录的合法组件名单里**。
+        //   这是唯一同时满足「不误杀 Defender」与「不放过冒名」的判据。
+        if (!inSystem) {
+            static const char* kDefenderDirs[] = {
+                "\\program files\\windows defender\\",
+                "\\program files (x86)\\windows defender\\",
+                "\\microsoft\\windows defender\\",     // WOW64 重定向形态
+            };
+            // 该目录下的合法组件（Defender 真实会放的 exe）
+            static const char* kDefenderReal[] = {
+                "nissrv.exe", "msmpeng.exe", "mpcmdrun.exe", "mpsigstub.exe",
+                "mpengine.dll", "mpclient.dll", "wscsvc.exe",
+            };
+            for (const char* d : kDefenderDirs) {
+                const size_t dn = strlen(d);
+                const size_t at = l.find(d);
+                if (at == std::string::npos) continue;
+                const size_t after = at + dn;
+                if (after >= l.size()) continue;
+                // 目录之后不允许再有子目录（否则是更深一层的冒充）
+                if (l.find_first_of("\\/", after) != std::string::npos) continue;
+                // 且文件名必须是 Defender 的真实组件之一
+                if (IN_LIST(base, kDefenderReal)) { inSystem = true; break; }
+            }
+        }
         if (!inSystem) {
             v.level = 2; v.score = 65; v.hard = true; v.tag = "masquerade";
             v.reason = "进程名为 " + base + " 但不在系统目录（" + imagePath +
@@ -871,6 +1318,27 @@ static ProcVerdict JudgeProcessInner(ProcEntity e) {
         std::string l = Lower(e.imagePath);
         bool sysDir = Has(l, "\\windows\\system32\\") || Has(l, "\\windows\\syswow64\\") ||
                       Has(l, "\\windows\\winsxs\\");
+        // ★ 2026-10-03 补齐（与 JudgeImagePath 的 masquerade 判据对齐）：
+        //   微软安全组件装在 `C:\Program Files\Windows Defender\`（**带空格**），
+        //   原判据只认 `\windows\` 系 ⇒ Defender 的已签名组件走不到这条放行分支。
+        //   ⇒ 与伪装层保持同一口径（同样按 Defender 真实组件名单，不做整目录信任），
+        //      避免「伪装层当 Trojan、降权层当自己人」的自相矛盾。
+        if (!sysDir) {
+            static const char* kDefenderDirs[] = {
+                "\\program files\\windows defender\\",
+                "\\program files (x86)\\windows defender\\",
+                "\\microsoft\\windows defender\\",
+            };
+            static const char* kDefenderReal[] = {
+                "nissrv.exe", "msmpeng.exe", "mpcmdrun.exe", "mpsigstub.exe",
+                "mpengine.dll", "mpclient.dll", "wscsvc.exe",
+            };
+            for (const char* d : kDefenderDirs) {
+                if (Has(l, d) && IN_LIST(Lower(BaseName(e.imagePath)), kDefenderReal)) {
+                    sysDir = true; break;
+                }
+            }
+        }
         std::string signerL = Lower(signer);
         bool msSigned = Has(signerL, "microsoft");
         if (sysDir && msSigned) {
@@ -906,9 +1374,121 @@ static ProcVerdict JudgeProcessInner(ProcEntity e) {
         }
     }
 
+    // ---- 放行后监控提权（对抗反沙箱逃逸）----
+    //   受观察进程（沙箱初判 clean/suspicious 放行、但真机运行时被盯住的）若
+    //   暴露「已可疑」行为，直接升为高危处置。只升 level>=1 的；level0 的正常
+    //   行为绝不升档 —— 不对普通程序新增任何误报面。
+    if (e.observed && best.level >= 1 && best.level < 2) {
+        best.level = 2;
+        if (best.score < 55) best.score = 55;   // 拉到硬阈值以上保证定档
+        std::string base = best.reason.empty() ? "观察到可疑行为" : best.reason;
+        best.reason = "[放行后监控升级] " + base +
+            "（该程序沙箱初判未确认恶意、处于放行后监控期，行为触发即升级处置）";
+        best.tag = best.tag.empty() ? "observed-escalate" : (best.tag + "+observed");
+    }
+
+    // ---- ★★ 2026-10-03 EDR 闭环：模型层接入判定（此前**完全没接**，只跑影子）----
+    //  架构对比结论：西瓜/PYAS 都有独立的模型/IOA 判定层；我们有模型、有语料、
+    //  有推理（aimodel.cpp + aifeat.cpp 全部就位），**唯独判定层不调它**
+    //  ⇒ 「建了发动机没装在车上」。本次把车接上。
+    //
+    //  ★★ 三条硬纪律（决定它不会变成误报源）：
+    //  ① **取不到就完全不参与**。未装载模型 / 维度不符 / 输入含 NaN 一律 ok=false，
+    //     此时**不加权、不改档、不打误导性日志** —— 只打「模型未参与」的可观测行。
+    //     绝不用默认分数（返回 0 会被当成"模型判定无罪"）——
+    //     那等于用虚构判据影响处置（铁律：判据缺失必须可观测、不得静默补默认值）。
+    //  ② **模型只能加权，不能独立定罪**。它只调整 score 与降权 level，
+    //     绝不把 level 0 抬到 2（独立拦截）—— 那会让模型抖动直接变成误杀。
+    //  ③ **只对已判可疑的进程加权**（level>=1）。level 0 的正常程序一律不碰，
+    //     保证"新增模型层不新增任何误报面"。
+    {
+        if (sf::ai::GlobalModelLoaded()) {
+            // 特征输入：只用**已经算出来的平铺事实**，不做任何 I/O
+            //（与影子模式同一条纪律：BuildFeatures 必须是纯函数，见 aifeat.h）。
+            sf::ai::FeatureInput fin;
+            fin.imagePath       = e.imagePath;
+            fin.commandLine     = e.commandLine;
+            fin.parentImagePath = e.parentImagePath;
+            fin.signedImage     = (e.signState == 1);
+            // ★ 规则引擎结论用**真实字段名**（aifeat.h:199-203：ruleLevel/ruleScore/ruleHard/ruleTag），
+            //   这一组是刻意设计的——模型要把「规则怎么判的」也吃进去，
+            //   否则它只是看文件特征的第二套规则，起不到第二意见的作用。
+            fin.ruleLevel       = best.level;
+            fin.ruleScore       = best.score;
+            fin.ruleHard        = best.hard;
+            fin.ruleTag         = best.tag;
+            // 「文件属性」三项取不到就保持默认（aifeat.h:181 明确要求：默认是"无迹象"这一侧）
+            fin.fileNameIsRandom = false;
+            fin.hasAds           = false;
+            fin.createdAtAgeSec  = -1;      // -1 = 未知
+            fin.fileSizeBytes    = -1;      // -1 = 未知
+            fin.softLandedLv     = 0;
+            fin.softLandedSysZone= false;
+            sf::ai::FeatureVector fv = sf::ai::BuildFeatures(fin);
+
+            bool mok = false;
+            const float mscore = sf::ai::GlobalModelScore(fv, &mok);
+            if (!mok) {
+                // 模型给不出分数 —— 如实说「算不了」，不猜（与 aiscore 的处理一致）
+                static std::atomic<int> s_missLog{ 0 };
+                if (s_missLog.fetch_add(1, std::memory_order_relaxed) < 5)
+                    LogDbg("[ai] 模型给不出分数，本次不参与加权（pid 实体 " + e.imagePath + "）");
+            } else {
+                // 恶意分 0~1 → 折成 0~40 分的加权（刻意做小：它是"旁证"不是"铁证"）
+                const int bonus = (int)(mscore * 40.0f + 0.5f);
+                const int before = best.score;
+                best.score += bonus;
+                best.tag = best.tag.empty() ? "ai" : (best.tag + "+ai");
+
+                if (best.level >= 1) {
+                    // 低分进程 + 模型也认为低分 ⇒ 降权（可能是误报）
+                    if (mscore < 0.20f && best.level == 1 && !best.hard) {
+                        best.score = best.score / 2;
+                        best.level = (best.score >= 30) ? 1 : 0;
+                        if (best.level == 0) { best.reason += "（AI 模型评估为低风险，已降权）"; }
+                    }
+                }
+                LogDbg("[ai] 模型参与判定 " + e.imagePath + " 恶意分=" +
+                       std::to_string((int)(mscore * 100)) + "% 加权=" + std::to_string(bonus) +
+                       " 分数 " + std::to_string(before) + "→" + std::to_string(best.score) +
+                       "（规则判定 lv=" + std::to_string(fin.ruleLevel) + "）");
+            }
+        }
+    }
+
+    // ---- ★ 把「本次判定的完整输入与结论」逐条留证（无条件写主日志）----
+    //  排障时最缺的不是最终结论（那个日志里本来就有），而是**输入**：
+    //  命令行取到没有？取到的是哪条策略？签名是谁？命中了几条规则？
+    //  没有这些，「规则没生效」有四种完全不同的原因（规则不存在 / 规则加载了
+    //  但 needle 没命中 / 命令行压根没取到 / 命中了但被签名降权抹平），
+    //  而它们在日志里长得一模一样 —— 这就是「静默漏报」最难查的地方。
+    //
+    //  ★ **无条件**写，不设开关、不过滤。原因：
+    //    ① 这条只写日志、**绝不参与判定**（不接触任何评分变量），
+    //       所以它没有"改变行为"的风险，不需要用开关来担保；
+    //    ② 而一旦需要开关，就多出「开关忘了开 ⇒ 又一次静默漏报」这种失效 ——
+    //       而那正是本项目反复踩的同一族（拿不到被当成没问题）。
+    //    ③ 量级可接受：每个新进程一行，日志本来就有周期统计。
+    //  ★ 只引用本函数作用域内确实存在的变量（signer / signedFile 是本地补全结果，
+    //    比 e.signerName 更贴近"本次实际用了什么"）。
+    LogDbg("[judge] pid=" + std::to_string(e.pid) +
+        " img=" + (e.imagePath.empty() ? std::string("(空)") : e.imagePath) +
+        " cmd=" + (e.commandLine.empty() ? std::string("(空)") : e.commandLine) +
+        " cmdStrategy=" + std::to_string(e.cmdStrategy) +
+        " 签名=" + (signedFile ? ("有(" + signer + ")") : std::string("无")) +
+        " 父=" + (e.parentImagePath.empty() ? std::string("(空)") : e.parentImagePath) +
+        " | 结论 lv=" + std::to_string(best.level) +
+        " 分=" + std::to_string(best.score) +
+        " hard=" + (best.hard ? "1" : "0") +
+        " 观察=" + (e.observed ? "1" : "0") +
+        " 理由=" + (best.reason.empty() ? std::string("(无)") : best.reason));
+
     return best;
 }
 
+// ProcEntity 重载：实时判定链的主入口（service.cpp / resmon.cpp 都走这里）。
+// 单独保留一个薄包装，而不是让调用方自己填 ProcEntity 再调 JudgeProcessInner
+// —— 后者是 static，暴露不了；这个包装是唯一的公开通道。
 ProcVerdict JudgeProcess(const ProcEntity& e) {
     return JudgeProcessInner(e);
 }
@@ -962,52 +1542,21 @@ unsigned long ParentPidOfPid(unsigned long pid) {
     return ppid;
 }
 
-// 读目标进程命令行（需读 PEB；非本用户进程或权限不足时返回空）
-// 用 NtQueryInformationProcess 取 PEB 再 ReadProcessMemory —— 这是用户态唯一可行路径。
-typedef LONG (NTAPI *pfnNtQueryInformationProcess)(HANDLE, ULONG, PVOID, ULONG, PULONG);
-struct UNICODE_STR { USHORT Length; USHORT MaximumLength; PWSTR Buffer; };
-struct PEB_LDR_DATA_PARTIAL { BYTE Reserved1[16]; PVOID Reserved2[3]; LIST_ENTRY InMemoryOrderModuleList; };
-struct RTL_USER_PROCESS_PARAMETERS_PARTIAL {
-    BYTE Reserved1[16];
-    PVOID Reserved2[10];
-    UNICODE_STR ImagePathName;
-    UNICODE_STR CommandLine;
-};
-
-static std::string ReadRemoteCommandLine(HANDLE h) {
-    static pfnNtQueryInformationProcess pNtQIP = nullptr;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
-        HMODULE nt = GetModuleHandleW(L"ntdll.dll");
-        if (nt) pNtQIP = (pfnNtQueryInformationProcess)GetProcAddress(nt, "NtQueryInformationProcess");
-    }
-    if (!pNtQIP) return {};
-
-    // ProcessBasicInformation = 0
-    struct { PVOID Reserved1; PVOID PebBaseAddress; PVOID Reserved2[2]; ULONG_PTR UniqueProcessId; PVOID Reserved3; } pbi{};
-    ULONG retLen = 0;
-    if (pNtQIP(h, 0, &pbi, sizeof(pbi), &retLen) != 0 || !pbi.PebBaseAddress) return {};
-
-    // 读 PEB 里的 ProcessParameters 指针（64 位 PEB 偏移 0x20）
-    PVOID params = nullptr;
-    SIZE_T rd = 0;
-    if (!ReadProcessMemory(h, (PBYTE)pbi.PebBaseAddress + 0x20, &params, sizeof(params), &rd) || !params)
-        return {};
-
-    RTL_USER_PROCESS_PARAMETERS_PARTIAL upp{};
-    if (!ReadProcessMemory(h, params, &upp, sizeof(upp), &rd)) return {};
-    if (!upp.CommandLine.Buffer || upp.CommandLine.Length == 0) return {};
-
-    std::wstring wbuf(upp.CommandLine.Length / sizeof(wchar_t), L'\0');
-    if (!ReadProcessMemory(h, upp.CommandLine.Buffer, &wbuf[0], upp.CommandLine.Length, &rd))
-        return {};
-    int need = WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), nullptr, 0, nullptr, nullptr);
-    if (need <= 0) return {};
-    std::string out(need, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wbuf.c_str(), (int)wbuf.size(), &out[0], need, nullptr, nullptr);
-    return out;
-}
+// ---------------------------------------------------------------------------
+//  ★ 2026-10-03 Win10 适配：原 ReadRemoteCommandLine() 已移除，迁到 sf::compat。
+//
+//  移除原因（不是重构洁癖，是它本身就是断点）：
+//    ① 硬编码 `PEB + 0x20`（x64 专属偏移），x86 构建直接读错位置；
+//    ② RTL_USER_PROCESS_PARAMETERS_PARTIAL 的成员布局（Reserved2[10] 后取 CommandLine）
+//       **按 Windows 版本不同**，Win10 早期与 Win11 的偏移不一样 —— 单一硬编码
+//       布局在两个版本上只有一个对；
+//    ③ 读空后在 MakeEntityOfPid 里被 `commandLine = imagePath` **静默顶替**，
+//       规则库几乎全是命令行子串匹配 ⇒ 一律 0 分 ⇒ 静默漏报且不报任何错。
+//       VM（Win10）实测 40+ 条「命令行暂不可得」，conhost/sc/MpCmdRun 全是瞬间进程。
+//
+//  替代能力见 sfcompat.h：按位宽取 PEB 偏移 + 按版本候选偏移试 CommandLine +
+//  走 Ldr 链表兜底 + **读不到就如实留空并回报策略号**。
+// ---------------------------------------------------------------------------
 
 ProcEntity MakeEntityOfPid(unsigned long pid) {
     ProcEntity e;
@@ -1017,11 +1566,92 @@ ProcEntity MakeEntityOfPid(unsigned long pid) {
     if (e.parentPid) e.parentImagePath = ImagePathOfPid(e.parentPid);
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, (DWORD)pid);
     if (h) {
-        e.commandLine = ReadRemoteCommandLine(h);
+        // ★ 2026-10-03 Win10 适配：改走 sf::compat 的多策略实现。
+        //   旧实现（此函数已移除）硬编码 PEB+0x20 + 单一位宽假设，Win10 上大面积读空，
+        //   而下一行的静默降级会把空命令行顶替成 imagePath ⇒ 命令行规则全 0 分 ⇒
+        //   **静默漏报且不报任何错**（铁律 41）。VM 实测 40+ 条「命令行暂不可得」。
+        //   新实现按位宽取 PEB 偏移 + 按版本候选偏移试 CommandLine，并回报实际策略。
+        e.commandLine = sf::compat::ReadRemoteCommandLineEx(h, &e.cmdStrategy);
         CloseHandle(h);
     }
-    if (e.commandLine.empty()) e.commandLine = e.imagePath;   // 降级：至少给映像路径
+    // ★ 降级不再静默：读不到就留空，由 JudgeProcessInner 侧打点，
+    //   否则「规则没生效」与「命令行没取到」两种失败在日志里长得一模一样。
     return e;
+}
+
+// ---------------------------------------------------------------------------
+//  实时注入信号（auditapi.cpp 调用）：把"对敏感目标的注入类操作"折算成评分层权重
+// ---------------------------------------------------------------------------
+static bool IsSensitiveTarget(const std::string& imagePath) {
+    if (imagePath.empty()) return false;
+    std::string b = Lower(BaseName(imagePath));
+    static const char* const kSens[] = {
+        "lsass.exe", "winlogon.exe", "services.exe", "lsm.exe", "csrss.exe",
+        "svchost.exe", "explorer.exe",
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe",
+        "wechat.exe", "qq.exe", "telegram.exe", "discord.exe", "whatsapp.exe",
+        "outlook.exe", "thunderbird.exe",
+        "silverfoxguardsvc.exe", "silverfoxenvscansvc.exe",
+    };
+    for (auto s : kSens) if (b == s) return true;
+    return false;
+}
+
+ProcVerdict JudgeInjectionActivity(unsigned long sourcePid,
+                                   const std::string& targetImage,
+                                   uint32_t desiredAccess,
+                                   bool setContextThread,
+                                   InjHandleKind kind) {
+    ProcVerdict v;
+    if (!sourcePid) return v;
+
+    // 注入能力判定：SetContextThread 是铁证；OpenProcess/OpenThread 需具备相应的
+    //   「经典注入组合」才算前兆。普通信息读取（PROCESS_QUERY_INFORMATION /
+    //   THREAD_QUERY_INFORMATION）不计入，避免把一切合法句柄申请误判成注入。
+    //
+    // ★ 两套掩码位定义互不相同，绝不能混用（旧版把 PROCESS_ 位套到 OpenThread 上，
+    //   造成 OpenThread 语义错位 —— OpenThread 事件带的是 THREAD_* 位）：
+    //   · PROCESS_：CREATE_THREAD=0x2、VM_OPERATION=0x8、VM_WRITE=0x20
+    //   · THREAD_ ：SUSPEND_RESUME=0x2、GET_CONTEXT=0x8、SET_CONTEXT=0x10、WRITE=0x20
+    //   OpenProcess 前兆 = CREATE_THREAD + (VM_OPERATION|VM_WRITE)   （造远程线程）
+    //   OpenThread  前兆 = SUSPEND_RESUME + (SET_CONTEXT|GET_CONTEXT)（线程执行劫持）
+    constexpr uint32_t kProcCreateThread = 0x0002;  // PROCESS_CREATE_THREAD
+    constexpr uint32_t kProcVmOperation  = 0x0008;  // PROCESS_VM_OPERATION
+    constexpr uint32_t kProcVmWrite      = 0x0020;  // PROCESS_VM_WRITE
+    constexpr uint32_t kThreadSuspend    = 0x0002;  // THREAD_SUSPEND_RESUME
+    constexpr uint32_t kThreadGetContext = 0x0008;  // THREAD_GET_CONTEXT
+    constexpr uint32_t kThreadSetContext = 0x0010;  // THREAD_SET_CONTEXT
+
+    bool injectionCapable = setContextThread;
+    if (!injectionCapable) {
+        if (kind == InjHandleKind::Thread) {
+            injectionCapable = (desiredAccess & kThreadSuspend) &&
+                               (desiredAccess & (kThreadSetContext | kThreadGetContext));
+        } else {
+            injectionCapable = (desiredAccess & kProcCreateThread) &&
+                               (desiredAccess & (kProcVmOperation | kProcVmWrite));
+        }
+    }
+    if (!injectionCapable) return v;
+
+    ProcEntity e = MakeEntityOfPid(sourcePid);   // 基线实体（映像/命令行/父链）
+    v = JudgeProcess(e);                          // 沿用既有评分层做基线
+
+    bool sensitive = IsSensitiveTarget(targetImage);
+    bool reputable = ProcReputable(e.imagePath);   // 知名厂商签名/可信路径 → 不加权
+
+    if (sensitive && !reputable) {
+        // ★ 沿用评分层加权（对齐 Bitdefender ATC 的阈值模型），不新增白名单判据：
+        //   注入指向敏感目标 + 源非可信 → 至少升为"可疑"（告警），由上层决定是否处置。
+        //   不直接定档高危（level 2 / 自动终止），避免误报把正常程序杀掉 —— 铁律：
+        //   误报比漏报更致命。自动终止交由后续与银泊联调的拦截链路。
+        v.score += 45;
+        if (v.level < 1) v.level = 1;
+        if (v.tag.empty()) v.tag = "injection-into-sensitive";
+        v.reason += "；实时检测到对敏感进程(" + BaseName(targetImage) +
+                    ")的注入类操作（源=" + BaseName(e.imagePath) + "）";
+    }
+    return v;
 }
 
 }  // namespace sf

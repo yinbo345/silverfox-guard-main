@@ -47,6 +47,37 @@ CleanReport AdvancedCleanFiles(const std::vector<std::string>& targets);
 // 收集「当前扫描结果」中可清除的文件目标（category=="文件" 且 path 非空），已去重。
 std::vector<std::string> CollectCleanTargets();
 
+// ---------------------------------------------------------------------------
+//  衍生物定点清除（2026-09-20 新增）——供实时拦截三条路径联动调用
+//
+//  与 CleanFiles / AdvancedCleanFiles 的区别：
+//    · 只清「种子样本的衍生物」（同目录 + 高发区的短随机名载荷），不碰用户正常文件；
+//    · **不杀种子进程**（种子进程由调用方负责终止），只清它释放/拉起的伴生文件；
+//    · 强制执行路径白名单（见下），任何落在白名单目录里的文件一律不动；
+//    · 文件数有硬上限，避免实时路径被扫盘拖慢。
+//
+//  为什么必须带白名单：衍生物判据是「短随机名 + 可执行扩展名」，在 Temp/Downloads/
+//  ProgramData/Users\Public 里按名字扫。而**游戏反作弊**（EasyAntiCheat / BattlEye /
+//  ACE / Vanguard / Riot Vanguard 等）恰好会把随机名组件释放到 ProgramData、
+//  Temp 这些目录 —— 不加白名单就是实打实的误删事故（毁游戏 = 用户直接卸载我们）。
+//
+//  参数 seedPaths   ：种子样本路径（被判高危的文件 / 被终止进程的映像路径）。
+//  参数 outReport   ：可选，回填本次清除的统计与明细（供弹窗文案与历史记录）。
+//  参数 dryRun      ：true = 只枚举不删除（用于先验证误删面，默认 false）。
+//  返回实际删除（含登记重启删除）的文件数。
+// ---------------------------------------------------------------------------
+int SweepDerivatives(const std::vector<std::string>& seedPaths,
+                     CleanReport* outReport = nullptr,
+                     bool dryRun = false);
+
+// 判断一个路径是否落在「绝不清理」的白名单内（反作弊、游戏平台、系统目录、我方程序、
+// 以及用户在配置里登记的信任目录）。暴露出来供 service.cpp 与测试脚本共用。
+bool IsNeverCleanPath(const std::string& path);
+
+// 登记一条用户信任目录（该目录及其子目录下的文件永不进入任何清除流程）。
+// 供扩展端「信任区」/ 配置项调用；内部自动小写化并补尾部反斜杠。
+void AddNeverCleanDir(const std::string& dir);
+
 // ---- 清除进度（服务写 / 弹窗读）----
 // 弹窗运行在用户桌面会话，拿不到服务内存里的进度，故经
 // %ProgramData%\SilverFoxGuard\clean_progress.txt 传递，格式：

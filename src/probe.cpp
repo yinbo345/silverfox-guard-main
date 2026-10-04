@@ -261,6 +261,37 @@ static const char* DetectType(const std::string& path, const PeInfo& pi, size_t 
 // ================================================================ 结构异常分析
 struct Anom { int w; std::string name, desc; };   // w: 证据权重 1/2/3
 
+// ---------------------------------------------------------------------------
+//  ★ LooksLikeInstallerExe（2026-10-03 新增，供落地捕获分流用）
+// ---------------------------------------------------------------------------
+//  问题：`packscan::IsArchiveExt()` 只认 21 种**归档扩展名**（zip/rar/7z/…），
+//        **`.exe` 不在内**。而银狐本体恰恰是「PE 头 + 内嵌 Inno/NSIS 载荷」的
+//        自解压安装包（扩展名就是 .exe）⇒ 它永远进不了 packscan 队列，
+//        只能靠单文件静态判定 —— **而单文件判定看不见包内的真实载荷**。
+//        实测：138,913,585 B 的 Inno 包（YouDaoX64.exe）
+//              `条目=21 nExec=0 nArchive=0 -> 跳过(包内无可执行项/嵌套包)`
+//              随后 `level=2 score=320` 判得又准，**却因不解包而永远看不到里面是什么**。
+//
+//  判据：**只看外层魔数，不看扩展名**。
+//    - "Inno Setup Setup Data ("  → Inno Setup（银狐常用）★ 只需扫这一条
+//    - "NullsoftInst"             → NSIS
+//  ★ 刻意**不**复用 DetectType：那个要完整解析 PE 头（ParsePeHeader），
+//    而这里在 5 秒轮询的实时路径上，只想花一次小文件扫描的成本做分流判断。
+//  ★ 失败返回 false = 宁可漏分流（走原路径），**绝不误分流**。
+bool LooksLikeInstallerExe(const std::string& path) {
+    try {
+        const std::string l = lower(path);
+        // 只对可执行体做这个判断（省掉一次文件扫描）
+        if (!(ends_with_i(l, ".exe") || ends_with_i(l, ".com") || ends_with_i(l, ".scr")))
+            return false;
+        if (FindAsciiMagic(path, "Inno Setup Setup Data (", 16)) return true;
+        if (FindAsciiMagic(path, "NullsoftInst", 16)) return true;
+        return false;
+    } catch (...) {
+        return false;   // 任何异常都当"不是安装器"，交回原路径
+    }
+}
+
 static double SectionEntropyAt(const std::string& path, DWORD rawPtr, DWORD rsz, void* tmp, size_t tmpSize) {
     if (rsz == 0) return -1.0;
     std::ifstream f(path, std::ios::binary);
@@ -489,8 +520,19 @@ static int VerifySigVerdict(const std::string& path, bool* hasTimestamp) {
 
 // 检测特征串全部外置于规则文件（probe_rules.txt，随安装包分发），二进制内不保存任何恶意串，
 // 避免杀软对「内含恶意家族特征串的程序本体」静态误报（火绒 Trojan/Loader 类）。
+// 家族特征串：一条规则 = (家族ID, 特征串)
+//
+// ★ 2026-09-22 扩展：从「银狐专用」扩为**多家族定位**。
+//   · 旧格式 `F|串`       → 家族固定 SilverFox（**完全兼容**，现有规则文件一行都不用改）
+//   · 新格式 `G|家族|串`  → 指定家族（Gh0st / ValleyRAT / Miner / Ransom / GenericRAT …）
+//
+//   为什么用「家族 + 特指串」而不是关键词泛匹配：probe 的既定原则是
+//   "仅样本库/权威报告确认过的极特指项，不做任何泛化关键词"（见上方注释）。
+//   泛化词（如 "rat" "miner"）会大面积误报，而家族定位的价值恰在于**准**。
+struct FamilyRule { std::string id, needle; };
 struct RuleSet {
-    std::vector<std::string> family, badname, hijack, bait, spoof;
+    std::vector<FamilyRule>  family;
+    std::vector<std::string> badname, hijack, bait, spoof;
 };
 static std::string RulesFilePath() {
     char exe[MAX_PATH]; GetModuleFileNameA(nullptr, exe, MAX_PATH);
@@ -504,11 +546,30 @@ static std::string RulesFilePath() {
     for (const auto& c : cands) if (file_exists(c)) return c;
     return "";
 }
+// ★ 纵深防御（2026-09-25 取证新增）：规则值里禁止出现控制字符。
+//   即使已经改成二进制读取，也不能让脏数据进入匹配引擎 —— 含 0x00/0x1A 的"规则串"
+//   永远匹配不到正常文件名，却会污染规则表、让 rules loaded 计数虚高、掩盖真正的编码事故。
+//   这里静默跳过并单独计数，LoadRules 结束时会在日志里明确报出来（便于事后发现文件被破坏）。
+static bool HasCtrlChars(const std::string& s) {
+    for (unsigned char c : s) if (c < 0x20 || c == 0x7F) return true;
+    return false;
+}
 static RuleSet LoadRules() {
     RuleSet r;
+    size_t dirty = 0;   // 被跳过的脏规则条数
     std::string fp = RulesFilePath();
     if (fp.empty()) { sf::LogDbg("[probe] rules file missing -> empty tables"); return r; }
-    std::ifstream f(fp);
+    // ★★★ 必须以二进制模式打开 —— 这是本文件最贵的一行修复（2026-09-25）。
+    //   事故现场：probe_rules.txt 第 61 行的 B| 段曾被转码工具损坏、混入了 0x1A（Ctrl+Z）。
+    //   MSVC 的 std::ifstream 在**文本模式**下把 0x1A 当作文档结束符 —— 于是该行之后的
+    //   70 行规则**全部读不到**：
+    //     · S|（伪装热门软件名）14 条 → 全丢（chrome/qq/wechat/wps/taobao/alipay/360/telegram…）
+    //     · G|（多家族特征串）丢 19 条 → Miner 挖矿 / Ransom 勒索 / GenericRAT 远控 一条都没生效
+    //     · B|（钓鱼诱饵词）14 条 → 只剩第 1 条
+    //   日志铁证：`rules loaded: 30 family / 8 names / 12 hijack / 1 bait / 0 spoof`
+    //   文件实写：49 family / 8 names / 12 hijack / 14 bait / 14 spoof
+    //   教训：规则库「写了但读不进来」比「完全没写」更危险 —— 它让所有人以为防护已经生效。
+    std::ifstream f(fp, std::ios::binary);
     if (!f) { sf::LogDbg("[probe] rules open fail: " + fp); return r; }
     std::string line;
     while (std::getline(f, line)) {
@@ -517,8 +578,19 @@ static RuleSet LoadRules() {
         if (line.size() < 3 || line[1] != '|') continue;
         std::string v = line.substr(2);
         if (v.empty()) continue;
+        if (HasCtrlChars(v)) { ++dirty; continue; }   // ★ 纵向防御：脏数据永不进匹配引擎
         switch (line[0]) {
-            case 'F': r.family.push_back(lower(v)); break;
+            case 'F': r.family.push_back({"SilverFox", lower(v)}); break;   // 兼容旧格式：F| 归银狐
+            case 'G': {                                                      // ★ 新格式 G|家族|特征串
+                size_t p = v.find('|');
+                if (p != std::string::npos && p > 0) {
+                    std::string id = v.substr(0, p);
+                    std::string nd = lower(v.substr(p + 1));
+                    // 特征串短于 5 字符会大面积误报（既定原则：只收极特指项）
+                    if (nd.size() >= 5 && !id.empty()) r.family.push_back({id, nd});
+                }
+                break;
+            }
             case 'N': r.badname.push_back(lower(v)); break;
             case 'H': r.hijack.push_back(lower(v)); break;
             case 'B': r.bait.push_back(v); break;
@@ -528,10 +600,27 @@ static RuleSet LoadRules() {
     sf::LogDbg("[probe] rules loaded: " + std::to_string(r.family.size()) + " family / " +
                std::to_string(r.badname.size()) + " names / " + std::to_string(r.hijack.size()) +
                " hijack / " + std::to_string(r.bait.size()) + " bait / " + std::to_string(r.spoof.size()) + " spoof");
+    // ★ 脏规则告警：有跳过就一定是文件被破坏过，必须留痕（否则规则静默变少永远查不出来）
+    if (dirty)
+        sf::LogDbg("[probe] ⚠ 规则文件含 " + std::to_string(dirty) +
+                   " 条脏数据（控制字符），已跳过 —— 请检查 data\\probe_rules.txt 的编码是否被破坏");
     return r;
 }
 static const RuleSet& Rules() { static const RuleSet r = LoadRules(); return r; }
-static const std::vector<std::string>& FamilyStrings() { return Rules().family; }
+static const std::vector<FamilyRule>& FamilyRules() { return Rules().family; }
+
+// 家族 ID → 中文显示名。
+// 未登记的 ID 原样返回 —— 这样规则文件里加一个新家族时不会显示成空白，
+// 而是显示它的 ID，让人一眼看出"这里有个没登记中文名的家族"。
+static std::string FamilyDisplayName(const std::string& id) {
+    if (id == "SilverFox")  return "银狐（游蛇）";
+    if (id == "Gh0st")      return "Gh0st 幽灵";
+    if (id == "ValleyRAT")  return "ValleyRAT";
+    if (id == "Miner")      return "挖矿木马";
+    if (id == "Ransom")     return "勒索软件";
+    if (id == "GenericRAT") return "通用远控木马";
+    return id;
+}
 static const std::vector<std::string>& KnownBadNames() { return Rules().badname; }
 static const std::vector<std::string>& HijackDlls() { return Rules().hijack; }
 static const std::vector<std::string>& BaitKws() { return Rules().bait; }
@@ -748,9 +837,13 @@ static bool ListArchiveMeta(const std::wstring& sevenZ, const std::string& path,
 
 // 解压到指定目录（-aos 跳过已存在，-y 静默；超 600 秒视为失败）。
 // 7z 退出码：0=成功 1=有警告但文件已解出（NSIS/Inno 常返回 1/2 附带尾部提示）——1 视为成功
-static bool ExtractArchive7z(const std::wstring& sevenZ, const std::string& path, const std::wstring& tmpDir) {
-    wchar_t wpath[MAX_PATH] = {0};
-    if (MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath, MAX_PATH) <= 0) return false;
+//
+// ★ 2026-09-27：拆成「宽字符核心 + ANSI 包装」两段，供沙箱模块复用。
+//   沙箱需要对**已解压出来的载荷**送检（压缩包本身在沙箱里没有"跑起来"这回事），
+//   解压这一步必须与全盘/单文件扫描链**共用同一个实现**，否则两条链路的
+//   7z 调用参数（-aos/-y/超时/退出码语义）会悄悄漂移。
+static bool ExtractArchive7zW(const std::wstring& sevenZ, const std::wstring& wpath,
+                              const std::wstring& tmpDir) {
     std::wstring cmd = L"\"" + sevenZ + L"\" x -y -aos -o\"" + tmpDir + L"\" \"" + wpath + L"\"";
     STARTUPINFOW si3{}; si3.cb = sizeof(si3);
     PROCESS_INFORMATION pi3{};
@@ -762,6 +855,12 @@ static bool ExtractArchive7z(const std::wstring& sevenZ, const std::string& path
     else GetExitCodeProcess(pi3.hProcess, &code);
     CloseHandle(pi3.hProcess); CloseHandle(pi3.hThread);
     return w == WAIT_OBJECT_0 && (code == 0 || code == 1);
+}
+
+static bool ExtractArchive7z(const std::wstring& sevenZ, const std::string& path, const std::wstring& tmpDir) {
+    wchar_t wpath[MAX_PATH] = {0};
+    if (MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath, MAX_PATH) <= 0) return false;
+    return ExtractArchive7zW(sevenZ, wpath, tmpDir);
 }
 
 // ANSI(系统代码页) → UTF-8（用于管道帧传输）
@@ -785,6 +884,15 @@ static std::string WideToUtf8(const std::wstring& w) {
     std::string u(nu - 1, '\0');
     WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &u[0], nu, nullptr, nullptr);
     return u;
+}
+// UTF-8 → 宽字符（供沙箱模块复用；项目铁律：路径必须转 UTF-16 再用 W 版 API）
+static std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int nw = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (nw <= 1) return std::wstring();
+    std::wstring w(nw - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], nw);
+    return w;
 }
 static std::string WideToAnsi(const std::wstring& w) {
     if (w.empty()) return std::string();
@@ -826,6 +934,7 @@ struct Verdict {
     int score = 0;
     std::string type = "OTHER";
     std::string title;
+    std::string family;         // ★ 命中的家族 ID（空 = 未定家族）；供 UI 显示"疑似 X 家族"
     std::vector<Anom> hits;     // 按证据权值列出
 };
 static std::string JsonEsc(const std::string& s) {
@@ -900,11 +1009,15 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
     bool installer = (std::string(typeS) == "NSIS" || std::string(typeS) == "INNO");
 
     // 3) 内容层（家族串 / 白加黑）——只对可执行/安装器/压缩包做，避免对文档等误扫
-    std::string familyHit, hijackHit;
+    std::string familyHit, hijackHit, familyId;
     if (peOk || installer || std::string(typeS) == "ZIP") {
         std::string c = read_lower_content(path, 2 << 20);
-        for (const auto& f : FamilyStrings())
-            if (c.find(f) != std::string::npos) { familyHit = f; break; }
+        for (const auto& fr : FamilyRules())
+            if (c.find(fr.needle) != std::string::npos) {
+                familyHit = fr.needle;
+                familyId  = fr.id;      // ★ 多家族定位：连带记下是哪个家族
+                break;
+            }
         for (const auto& d : HijackDlls())
             if (c.find(d) != std::string::npos) { hijackHit = d; break; }
     }
@@ -943,8 +1056,21 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
                     v.hits.push_back({0, "压缩包内容", "包内未发现可执行文件项。"});
                 // 受控解压：单包 ≤1GB、条目 ≤20000、含可执行项/嵌套压缩包、且总预算未超限时才解。
                 // 纯文档包（无 exe 无嵌套包）不解，避免白费 IO。大型安装包（数百 MB/数千条目）照常解。
+                //
+                // ★★ 2026-10-03 修正（真样本实证，preview4 之前一直漏这一类）：
+                //   根因 = **7z 会把安装器的 PE 节区当成包内条目列出来**，而这些"条目名"
+                //   往往是 `.text`/`.rsrc` 之类，**没有一个像可执行文件** ⇒ nExec=0
+                //   ⇒ 命中 `nExec==0 && nArchive==0` ⇒ **主动跳过解包**。
+                //   实证：138,913,585 B 的 Inno 包（银狐本体 YouDaoX64.exe）
+                //        日志 `条目=21 总量=138913585B nExec=0 nArchive=0 -> 跳过(包内无可执行项/嵌套包)`，
+                //        同一文件随后 `level=2 score=320` 判得又准，**却因不解包而永远看不到里面是什么**。
+                //   修法：**外层已经确认是安装器**（NSIS/INNO）时，条目名不可信 ——
+                //        它内层**必然**是文件，必须解。判据从"条目名像不像可执行体"
+                //        改成"**外层类型 + 条目数**"，不依赖 7z 的条目命名。
+                const bool installerForced = installer && meta.size() > 0;
                 const bool canUnpack = (totalSize > 0 && totalSize <= (1ull << 30) &&
-                                        meta.size() <= 20000 && (nExec > 0 || nArchive > 0) &&
+                                        meta.size() <= 20000 &&
+                                        (nExec > 0 || nArchive > 0 || installerForced) &&
                                         g_probeExtracted + totalSize <= kMaxProbeExtracted);
                 // 解包决策日志（此前该分支一行日志都没有，导致「为什么不解包」完全不可诊断）
                 {
@@ -952,11 +1078,12 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
                     if (!(totalSize > 0)) why = "总量解析为0";
                     else if (totalSize > (1ull << 30)) why = "总量超1GB";
                     else if (meta.size() > 20000) why = "条目超2万";
-                    else if (!(nExec > 0 || nArchive > 0)) why = "包内无可执行项/嵌套包";
+                    else if (!(nExec > 0 || nArchive > 0) && !installerForced) why = "包内无可执行项/嵌套包";
                     else if (!(g_probeExtracted + totalSize <= kMaxProbeExtracted)) why = "累计预算耗尽";
                     sf::LogDbg("[probe-pack] " + base + " 条目=" + std::to_string(meta.size()) +
                                " 总量=" + std::to_string(totalSize) + "B nExec=" + std::to_string(nExec) +
                                " nArchive=" + std::to_string(nArchive) +
+                               (installerForced ? " [安装器强制解包]" : "") +
                                (canUnpack ? " -> 解包" : (" -> 跳过(" + why + ")")));
                 }
                 if (canUnpack) {
@@ -1050,8 +1177,12 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
     } else if (familyStrong) {
         v.level = validSig ? 1 : 2;                        // 有效签名降为可疑
         v.score += validSig ? 100 : 320;
-        v.title = "命中银狐家族特征串";
-        v.hits.push_back({3, "银狐家族特征串", "文件内容包含银狐家族确认特征（" + std::string(familyHit) + "）。"});
+        // ★ 多家族定位：把家族 ID 带出去，UI 据此显示「疑似 X 家族」而不是笼统的"银狐"
+        v.family = familyId;
+        const std::string famName = FamilyDisplayName(familyId);
+        v.title = "命中" + famName + "家族特征串";
+        v.hits.push_back({3, famName + "家族特征串",
+                          "文件内容包含" + famName + "确认特征（" + familyHit + "）。"});
         // 白加黑：仅「无签名的安装器（NSIS/Inno 静态包）」命中才定罪——包内含被劫持模块名是真实投递信号；
         // 普通 PE/脚本命中系统 DLL 名（powrprof/version/dbghelp…）极常见（正常安全/系统工具都会引用），
         // 不再凭内容字符串判危（教训：自家 SilverFoxEnvScanSvc.exe 被误报 300 分）。普通命中只作展示旁证。
@@ -1100,7 +1231,14 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
     };
     std::string j;
     j += "{\"level\":" + std::to_string(v.level) + ",\"score\":" + std::to_string(v.score) +
-         ",\"type\":\"" + v.type + "\",\"title\":\"" + JsonEsc(v.title) + "\",\"hits\":[";
+         ",\"type\":\"" + v.type + "\",\"title\":\"" + JsonEsc(v.title) + "\"";
+    // ★ 多家族定位结果。空时不输出该字段 —— 前端据此判断「未定家族」，
+    //   避免显示一个空的家族标签（那会让人以为"分析失败"）。
+    if (!v.family.empty()) {
+        j += ",\"family\":\""     + JsonEsc(v.family) + "\"";
+        j += ",\"familyName\":\"" + JsonEsc(FamilyDisplayName(v.family)) + "\"";
+    }
+    j += ",\"hits\":[";
     bool first = true;
     for (const auto& h : v.hits) {
         if (h.name.empty() || isNoise(h)) continue;
@@ -1115,8 +1253,99 @@ std::string ScanTargetFile(const std::string& pathUtf8) {
     return j;
 }
 
+// ---------------------------------------------------------------------------
+//  导入的 DLL 名列表（白加黑检测的基础设施，2026-09-22）
+//
+//  为什么需要它：DLL 劫持 / 侧加载（"白加黑"）的典型形态是
+//      合法签名的 exe ＋ 同目录一个固定名恶意 DLL（version.dll / libcurl.dll …）
+//  这个 exe 本身是干净的，查它的签名毫无用处 —— **要抓的是那个 DLL**。
+//  而找 DLL 的唯一静态入口就是读 exe 的导入表：它声明了"我会加载哪些 DLL"。
+//
+//  与上面的 ParseImports 是两个用途，不要合并：
+//    · ParseImports  → 要**函数名**（判"只导入 LoadLibrary/GetProcAddress"= 动态解析/加壳特征）
+//    · ParseImportDlls → 要**DLL 名**（判同目录是否存在可被劫持的同名文件）
+//
+//  只读导入表描述符的 Name 字段（RVA → 文件偏移 → 读字符串），不解析 thunk，
+//  所以比 ParseImports 轻得多。
+// ---------------------------------------------------------------------------
+static bool ParseImportDlls(const std::string& path, const PeInfo& pi, std::vector<std::string>& out) {
+    out.clear();
+    if (pi.importRva == 0) return false;
+    DWORD raw = 0;
+    if (!RvaToRaw(pi, pi.importRva, &raw)) return false;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    for (DWORD i = 0; i < 64; ++i) {     // 描述符数组以全零项结尾；64 项是防御性上限
+        IMAGE_IMPORT_DESCRIPTOR d{};
+        f.seekg(raw + (std::streamoff)i * sizeof(d));
+        f.read((char*)&d, sizeof(d));
+        if (f.gcount() != sizeof(d)) break;
+        if (d.FirstThunk == 0 && d.Name == 0 && d.OriginalFirstThunk == 0) break;
+        if (d.Name == 0) continue;
+        DWORD nameRaw = 0;
+        if (!RvaToRaw(pi, d.Name, &nameRaw)) continue;
+        f.seekg(nameRaw);
+        char nb[256] = {0};
+        f.read(nb, sizeof(nb) - 1);
+        std::string dll = lower(nb);
+        // 去重（同一个 DLL 不会出现两次，但损坏样本可能有重复描述符）
+        if (!dll.empty() && std::find(out.begin(), out.end(), dll) == out.end())
+            out.push_back(dll);
+    }
+    return !out.empty();
+}
+
+bool ImportedDlls(const std::string& path, std::vector<std::string>& out) {
+    out.clear();
+    std::vector<uint8_t> head = read_prefix(path, 1 << 20);   // 1MB 足够覆盖节表
+    PeInfo pi;
+    if (!ParsePeHeader(head, pi) || !pi.ok) return false;
+    return ParseImportDlls(path, pi, out);
+}
+
 }  // namespace sfprobe
 
 namespace sf {
 std::string ScanTargetFile(const std::string& path) { return sfprobe::ScanTargetFile(path); }
+
+// 读取 PE 的导入 DLL 名（小写、去重）。
+// 返回 false = 非 PE 或解析失败 —— 调用方**不得**据此判定任何东西。
+bool ImportedDlls(const std::string& path, std::vector<std::string>& out) {
+    return sfprobe::ImportedDlls(path, out);
+}
+
+// ★ LooksLikeInstallerExe（2026-10-03）：判断 .exe 是否其实是自解压安装器。
+//   实现体在 sfprobe（它要用 static 的 lower/ends_with_i/FindAsciiMagic），
+//   这里只做转发 —— 与 ImportedDlls 同一模式，避免重复实现。
+bool LooksLikeInstallerExe(const std::string& path) {
+    return sfprobe::LooksLikeInstallerExe(path);
+}
+
+// ---------------------------------------------------------------------------
+//  归档解压（供沙箱模块复用）
+// ---------------------------------------------------------------------------
+// 定位：**这不是"解包分析"，是"把真实文件解压出来"**。
+//   沙箱模块需要拿到压缩包（zip/rar/7z/自解压 exe）里**落在磁盘上的真实载荷**，
+//   再把它们逐个送进沙箱**运行**观察。
+//   为什么不能直接把压缩包送沙箱：压缩包不是可执行体，送进去它"什么都不会发生"
+//   —— 那不是"干净"，那是**观察根本不适用**（见 sandbox.h 的 verdict 语义）。
+//   为什么不用 probe 的 ListArchiveMeta 那套"列条目 + 静态判定"：那是**静态**
+//   视角（只看包内文件名与内容特征）。沙箱要的是行为，必须真落盘、真运行。
+//   两者目标不同，不能互相替代。
+//
+// ⚠️ 编码纪律：入参是 **UTF-8**，本函数内部转 UTF-16 再传给 W 版 API /
+//    7z 命令行。项目铁律：UTF-8 路径必须转 UTF-16（中文文件名/路径）。
+std::string Find7z() {
+    const std::wstring w = sfprobe::Find7zTool();
+    return w.empty() ? std::string() : sfprobe::WideToUtf8(w);
+}
+
+bool ExtractArchiveTo(const std::string& archivePathUtf8, const std::string& destDirUtf8) {
+    const std::wstring sevenZ = sfprobe::Find7zTool();
+    if (sevenZ.empty()) return false;
+    const std::wstring wp = sfprobe::Utf8ToWide(archivePathUtf8);
+    const std::wstring wd = sfprobe::Utf8ToWide(destDirUtf8);
+    if (wp.empty() || wd.empty()) return false;
+    return sfprobe::ExtractArchive7zW(sevenZ, wp, wd);
+}
 }  // namespace sf

@@ -1,0 +1,18 @@
+# 签名私钥与密码——绝不进 git / 开源仓库（泄露即被盗用签名）
+signing/
+*.pfx
+*.pfx-password
+.pfx-password
+
+# ★ 病毒库签名私钥（由 dist\libsigkey.exe genkey 生成）
+#   拿到它就能伪造**任意**病毒库（往恶意库里塞良性条目 = 把杀软变成误报机器）。
+#   上面那条 `signing/` 已经覆盖，这里是第二层：万一有人将来放开 signing/，
+#   这些显式条目仍然拦得住。
+signing/sfh-signing.key
+signing/sfh-signing.pub
+sfh-signing.key
+*.sfhkey
+
+# 构建产物
+dist/
+*.obj

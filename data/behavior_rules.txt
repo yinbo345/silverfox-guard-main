@@ -68,8 +68,8 @@ H|2|regsvr32|scrobj|regsvr32 加载脚本对象（Squiblydoo 白利用）
 # ---------------------------------------------------------------------------
 #  三、隐藏窗口 / 规避察觉
 # ---------------------------------------------------------------------------
-H|2|hidden|windowstyle hidden|以隐藏窗口执行命令，规避用户察觉
-H|2|hidden|w hidden|以隐藏窗口执行命令
+S|15|hidden|windowstyle hidden|以隐藏窗口执行命令（自动化工具/安装脚本亦常用，弱旁证）
+S|15|hidden|w hidden|以隐藏窗口执行命令（自动化工具/安装脚本亦常用，弱旁证）
 
 # ---------------------------------------------------------------------------
 #  四、勒索 / 反取证 / 破坏恢复
@@ -89,9 +89,17 @@ H|1|boot|bcdedit|修改启动配置（可能破坏恢复模式）
 H|1|persist|schtasks /create|创建计划任务（持久化）
 H|1|persist|sc create|创建系统服务（持久化）
 H|1|fw|netsh advfirewall set|修改防火墙配置（关闭防护）
-H|2|killsav|360tray|针对 360 安全软件的操作（银狐常用手法）
-H|2|killsav|huorong|针对火绒安全软件的操作（银狐常用手法）
-H|1|killsav|windefend|针对 Windows Defender 服务的操作
+H|2|killsav|taskkill /f /im hips|强杀火绒主进程（银狐常用手法）
+H|2|killsav|taskkill /f /im wsctrl|强杀火绒服务进程（银狐常用手法）
+H|2|killsav|taskkill /f /im usysdiag|强杀火绒内核进程（银狐常用手法）
+H|2|killsav|taskkill /f /im 360|强杀 360 安全软件进程（银狐常用手法）
+H|2|killsav|taskkill /f /im msmpeng|强杀 Defender 引擎进程
+H|2|killsav|taskkill /f /im qqpcmgr|强杀腾讯电脑管家进程
+H|2|killsav|sc stop huorong|停止火绒服务（关闭防护）
+H|2|killsav|net stop huorong|停止火绒服务（关闭防护）
+H|2|killsav|sc delete huorong|删除火绒服务（关闭防护）
+H|2|killsav|sc stop windefend|停止 Defender 服务（关闭防护）
+H|1|killsav|fltmc unload|卸载文件系统过滤驱动（关闭防护，需结合目标）
 
 # ---------------------------------------------------------------------------
 #  六、凭据窃取
@@ -111,7 +119,7 @@ H|1|cred|mini dump|进程转储（可能用于凭据窃取）
 # ---------------------------------------------------------------------------
 S|15|psargs|-nop|PowerShell 跳过配置文件加载
 S|15|psargs|-w hidden|隐藏窗口启动
-S|20|psargs|bypass|绕过执行策略
+S|10|psargs|bypass|绕过执行策略
 S|10|net|http://|命令行含明文 HTTP 地址
 S|15|obfusc|base64|命令行含 base64 字样
 S|5|stage|.txt|从文本文件读取指令（银狐常用暂存方式）
@@ -163,8 +171,32 @@ H|1|inject|dll injection|DLL 注入（工具类命令行）
 # ---------------------------------------------------------------------------
 #  十一、远程控制木马（RAT）/ 反弹 Shell
 # ---------------------------------------------------------------------------
-H|2|rat|nc -e|netcat 反弹 Shell（RAT 标配）
-H|2|rat|ncat -e|ncat 反弹 Shell
+#  ★ 2026-10-03 收紧 needle（真样本误报复盘，Win10 虚拟机实证）：
+#    原 needle `nc -e`（5 字符，纯子串匹配）误杀微软已签名的同步中心 mobsync.exe 两次
+#    （VM 日志 22:04:36 / 22:11:03，同批还有 [sigcat] 目录签名通过 → 证件是真的）。
+#
+#  ★★ 误报的**精确机制**（不是「needle 太短」这么笼统）：
+#    ① `behavior.cpp` 构造了第二份匹配串 `lNoExe` = 归一化串**去掉 .exe 后缀**
+#       （条件：`.exe` 后接 空格/反斜杠/斜杠/串尾时跳过这 4 字节）；
+#    ② 外置规则的匹配是**纯子串 find，没有任何词边界**。
+#    于是 `...system32\mobsync.exe -e ...`：
+#      原始 l    = `c:\...\system32\mobsync.exe -e ...`   → **不含** `nc -e`
+#      去 exe 后 = `c:\...\system32\mobsync -e ...`      → **命中** `nc -e`！
+#    （`mobsync` 末尾的 `nc` + 空格 + `-e` 恰好拼出 needle）
+#    ⇒ **`lNoExe` 这个「贴心的去后缀」机制，反过来把合法进程名变成了攻击特征。**
+#
+#  ★★ 踩过的坑（别再走一遍）：**把 needle 改长解决不了**。
+#    改成 `nc.exe -e` 之后 `mobsync` 依然命中 —— 因为 needle 里的 `.` 在子串
+#    匹配里只是普通字符，而 `lNoExe` 又会把 `nc.exe` 还原成 `nc`，两边一对又拼上了。
+#    **靠加长 needle 表达「必须是 netcat」在纯子串匹配里行不通，只能靠词边界。**
+#
+#  ★ 修法：新增规则类型 `H~`（**带词边界**的硬规则）。
+#    `H~` 要求 needle 前后必须是分隔符（空格/反斜杠/斜杠）或串首/串尾 ⇒
+#    `mobsync -e` 不再命中（其 `nc` 前面是 `b`，不是分隔符）；
+#    而 `nc.exe -e cmd.exe` / `C:\tools\nc.exe -e x` 仍然命中。
+#    ⇒ needle 保持 `nc -e` 即可，**真阳性一点没漏**。
+H~|2|rat|nc -e|netcat 反弹 Shell（RAT 标配）
+H~|2|rat|ncat -e|ncat 反弹 Shell
 H|2|rat|bash -i >&|bash 反弹 Shell
 H|2|rat|/dev/tcp/|bash 内置 TCP 反弹（无文件攻击）
 H|1|rat|socat|socat 端口转发（常被 RAT 滥用）

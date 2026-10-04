@@ -1,8 +1,15 @@
 # 银狐主防 · 单文件查杀规则库
-# 格式：类型|值   F=家族串 N=已知坏名 H=白加黑模块名 B=钓鱼诱饵词 S=伪装热门软件名
+# 格式：类型|值   F=家族串（归 SilverFox）N=已知坏名 H=白加黑模块名 B=钓鱼诱饵词 S=伪装热门软件名
+# ★ 2026-09-22 新增多家族格式：G|家族ID|特征串
+#     家族ID：SilverFox(银狐/游蛇) Gh0st(幽灵) ValleyRAT Miner(挖矿) Ransom(勒索) GenericRAT(通用远控)
+#     特征串须 >=5 字符；短串会大面积误报（既定原则：只收极特指项，不做泛化关键词）。
+#     未登记的家族 ID 会原样显示，便于发现"加了串却忘了登记中文名"。
 # 改完本文件需重新安装（安装器会拷贝到安装目录 data\probe_rules.txt），或手动放入 C:\ProgramData\SilverFoxGuard\
-F|gh0st
-F|winos
+# ---- Gh0st 幽灵（银狐的上游家族）----
+#  说明：gh0st / winos 是 Gh0st 系列**通用标记**，并非银狐独有，归 Gh0st 更准确。
+#  银狐的能力不减 —— 下面仍有 consys* / getinstall64 / yoursharedsecretkey 等专有串。
+G|Gh0st|gh0st
+G|Gh0st|winos
 F|qQ996545
 F|global\admin!!!
 F|getinstall64
@@ -51,20 +58,25 @@ H|winhttp.dll
 H|libcef_dll_wrapper.dll
 H|log.dll
 H|cortanaapi.dll
-B|Ýª¥
-B|¥ºX
-B|ÁXe
-B|e¹H
-B|åDh
-B|èå
-B|ÝÄºX
-B|Z³
-B|éHVÑ
-B|äh
-B|%4
-B|e4Ñ>
-B|¡¡¥J
-B|³
+# ---- B 钓鱼诱饵词：文件名含人事/财务诱导词、且扩展名是可执行 → 直接判 2 分高危 ----
+#   银狐投递主力手法：把随机名载荷改名成「工资表.exe / 会议纪要.exe」这类企业内网高频文档名，
+#   骗过肉眼直觉与「命名正常所以安全」的默认假设。这里只收 2 字以上的特指短语，不做泛化关键词。
+#   ⚠ 2026-09-25：本节原 14 条曾被转码工具损坏（混入 0x1A 控制字符，导致其后 70 行规则全部读不到），
+#     原文已不可逆还原，现按同一语义（企业人事/财务高频文档名）重建。
+B|工资表
+B|工资条
+B|会议纪要
+B|员工名单
+B|通讯录
+B|报销单
+B|录用通知
+B|个人简历
+B|入职登记
+B|考勤表
+B|绩效考核
+B|调薪通知
+B|年终奖金
+B|补贴发放
 S|chrome
 S|chromee
 S|edge
@@ -79,3 +91,46 @@ S|alipay
 S|360
 S|telegram
 S|whatsapp
+
+# ============================================================================
+#  多家族定位规则（G|家族ID|特征串）—— 2026-09-22 新增
+# ============================================================================
+#  设计原则：只收**高特指**串。
+#   · 命中后输出「疑似 X 家族 + 家族名」给 UI，而不是笼统的"银狐"。
+#   · 家族串命中在判定里是**加权证据**（有效签名的文件会降级为"可疑"，
+#     不会仅凭一个字符串把签名正常的程序判为高危）。
+#   · 不收录的家族宁可留空 —— 编造特征串的代价是持续误报，比"识别不出"更糟。
+#
+#  ---- Miner 挖矿木马 ----
+#    矿池协议与主流挖矿内核名，均为高特指项。
+G|Miner|stratum+tcp
+G|Miner|stratum+ssl
+G|Miner|xmrig
+G|Miner|cryptonight
+G|Miner|randomx
+G|Miner|minergate
+G|Miner|nicehash
+
+#  ---- Ransom 勒索软件 ----
+#    勒索信固定英文短语：正常程序里不会出现，且跨家族复用率高。
+G|Ransom|your files are encrypted
+G|Ransom|all your files have been encrypted
+G|Ransom|your files have been encrypted
+G|Ransom|send bitcoin
+G|Ransom|decrypt your files
+
+#  ---- GenericRAT 通用远控（开源 RAT 家族标记）----
+#    这些都是具体产品名（不是"rat"这类泛化词）。误报面主要来自安全软件的
+#    分析报告/样本说明文档，但那些文件通常有签名或有明确文档类型，影响有限。
+G|GenericRAT|DarkComet
+G|GenericRAT|NjRAT
+G|GenericRAT|AsyncRAT
+G|GenericRAT|QuasarRAT
+G|GenericRAT|XWorm
+G|GenericRAT|Remcos
+G|GenericRAT|NanoCore
+
+#  ---- ValleyRAT ----
+#    ⚠️ 暂未收录：ValleyRAT（Winos 4.0 系）的可靠特指串尚未确认到可直接使用的程度。
+#    编一个猜测串会让这一行变成误报源。代码侧已保留 ValleyRAT 的家族中文名映射，
+#    将来拿到可靠串后**只需在本段加一行**，无需改代码。

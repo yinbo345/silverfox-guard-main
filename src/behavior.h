@@ -47,14 +47,26 @@ struct ProcVerdict {
 // ---------------------------------------------------------------------------
 struct ProcEntity {
     std::string imagePath;       // 进程映像全路径
-    std::string commandLine;     // 完整命令行
+    std::string commandLine;     // 完整命令行（★ 2026-10-03 起：取不到就是空，不再拿 imagePath 顶替）
     std::string parentImagePath; // 父进程映像全路径（取不到则为空）
     unsigned long pid      = 0;
     unsigned long parentPid = 0;
 
+    // ---- 命令行读取诊断（2026-10-03 Win10 适配新增）----
+    //  旧实现读空时静默降级 commandLine=imagePath，导致「规则没命中」与「命令行没取到」
+    //  在日志里长得一模一样（铁律 41：静默漏报）。现在把过程显式记下来：
+    //    cmdStrategy = 0 读取失败  1 直读 PEB  2 走 Ldr 链表兜底
+    //  判定层可据此打点，日志能区分「Windows 版本/时序不兼容」与「真无命令行」。
+    int         cmdStrategy = 0;
+
     // ---- 可选：由 FillTrustInfo() 填充，缺省时判定层自行补全 ----
     int         signState = -1;      // -1=未检测 0=未签名 1=已签名
     std::string signerName;          // 签名者显示名（能取到时）
+
+    // ---- 放行后监控标记：由沙箱放行档（clean/suspicious）登记、进程创建
+    //      事件源查观察名单后置位。受观察进程的「已可疑行为」会被判定层
+    //      直接升为高危处置（对抗反沙箱逃逸）。默认 false，不影响既有判定。 ----
+    bool        observed = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +87,34 @@ ProcVerdict JudgeParentChain(const std::string& parentImagePath,
 // 单独判定：命令行（供文件落地 / 计划任务 / 注册表启动项等其他事件源复用）
 ProcVerdict JudgeCommandLine(const std::string& commandLine,
                              const std::string& imagePath);
+
+// ---------------------------------------------------------------------------
+//  实时注入信号（来自 Audit-API-Calls ETW，auditapi.cpp 调用）
+// ---------------------------------------------------------------------------
+//  auditapi 采集到「sourcePid 对 targetImage 做了注入类操作」时，把 source 进程
+//  交给本函数做**补充分数**：沿用既有评分层（JudgeProcess 基线），仅当
+//    · 注入指向敏感目标（lsass / 浏览器 / 聊天软件 / 自身服务 / 系统关键进程），且
+//    · 源进程非可信厂商签名（ProcReputable 为假）
+//  才额外加权并升档（对齐 Bitdefender ATC 的分值阈值：55=可疑 / 130=高危）。
+//  ★ 铁律：不在此新增任何字符串 / 名单式判据 —— 只是给评分层加一个权重信号。
+//  返回该 source 进程补判后的 ProcVerdict（由调用方决定是否告警 / 处置）。
+//  · setContextThread=true  → id=4 NtSetContextThread（铁证注入，无需看 access mask）
+//  · setContextThread=false → id=5/6 的 NtOpenProcess/OpenThread，需 access mask
+//      含 VM_WRITE|VM_OPERATION|CREATE_THREAD 才算"具备注入能力"的前兆。
+//  ★ 访问掩码口径分两套 —— PROCESS_* 与 THREAD_* 是**互不相同的位定义**，切勿混用：
+//    · InjHandleKind::Process（NtOpenProcess）前兆 = CREATE_THREAD(0x2) + (VM_OP(0x8)|VM_WRITE(0x20))
+//    · InjHandleKind::Thread （NtOpenThread ）前兆 = SUSPEND_RESUME(0x2) + (SET_CTX(0x10)|GET_CTX(0x8))
+//    旧版把 PROCESS_ 位套用在 OpenThread 上 → 语义错位（THREAD_SUSPEND_RESUME 恰为 0x2，
+//    但线程侧要的是 THREAD_SET_CONTEXT=0x10，与 PROCESS_VM_OPERATION=0x8 不是一回事）。
+enum class InjHandleKind {
+    Process,   // NtOpenProcess（PROCESS_* 访问位）
+    Thread,    // NtOpenThread （THREAD_*  访问位）
+};
+ProcVerdict JudgeInjectionActivity(unsigned long sourcePid,
+                                   const std::string& targetImage,
+                                   uint32_t desiredAccess,
+                                   bool setContextThread,
+                                   InjHandleKind kind = InjHandleKind::Process);
 
 // ---------------------------------------------------------------------------
 //  归一化：命令行去混淆。这是抗绕过的关键层 ——

@@ -73,7 +73,7 @@ bool g_advStage = false;        // 当前是否处于「高级删除」阶段（
 std::string g_currentStatus;    // 当前告警卡状态（确认卡取消后返回此状态渲染）
 int  g_currentScore = 0;        // 当前告警卡评分
 // ---- 勒索回滚场景的上下文（由 --risk / --undo / --rolledback 传入）----
-std::wstring g_risk;            // L"high" | L"suspect" | 空（普通扫描告警）
+std::wstring g_risk;            // L"high"|L"suspect"|L"mbr"|L"proc"|L"regrun"|L"landed"|L"hashlanded"|空（普通扫描告警）
 std::string  g_undoToken;       // 撤销凭据（ANSI，仅 [0-9a-f]，已白名单过滤）
 bool         g_rolledBack = false;  // 本次是否真的发生过覆盖写
 int  g_resDeleted = 0, g_resDeferred = 0, g_resFailed = 0, g_resKilled = 0, g_resExtraDll = 0;
@@ -289,12 +289,22 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
     //   proc   = 可疑进程行为已自动终止（进程不能复活，无撤销；文件副作用归回滚引擎管）
     //   regrun = 可疑自启动项已自动移除（撤销 = 写回注册表原值）
     //   landed = 落地载荷已自动隔离（撤销 = 移回原位）
+    //   hashlanded = 病毒库命中的已知恶意样本已自动隔离（撤销 = 移回原位）
+    //                ★ 与 landed 的区别 = 「确凿（字节同一性）」vs「疑似（形态可疑）」
     // 卡面上的「某某程序」归因文本由 JS 经管道取 lastalert 回填（见 alertdetail）。
     const bool isBoot    = (g_risk == L"mbr");
     const bool isProc    = (g_risk == L"proc");
     const bool isRegrun  = (g_risk == L"regrun");
     const bool isLanded  = (g_risk == L"landed");
-    const bool isAutoKill = (isBoot || isProc || isRegrun || isLanded);
+    // ★★ hashlanded（2026-09-25 新增）= **病毒库（字节同一性）命中**的已知恶意样本，
+    //   已自动隔离。刻意与 landed 分成两个 risk 值，理由是两者的语义强度不同：
+    //     landed     = 「落在这个目录 + 形态可疑」→ 结论是**疑似**，用户该"看一眼再决定"
+    //     hashlanded = 「与库中样本逐字节一致」  → 结论是**确凿**，用户只需"清掉"
+    //   混成一张卡，用户就分不出「确凿」与「疑似」，也就无从判断该不该点「撤销」——
+    //   而这两种情况点撤销的代价完全不同（确凿样本恢复回去 = 主动放行已知恶意）。
+    //   撤销行为与 landed 完全一致（移回原位，token 前缀同为 30）。
+    const bool isHashLanded = (g_risk == L"hashlanded");
+    const bool isAutoKill = (isBoot || isProc || isRegrun || isLanded || isHashLanded);
     // 状态色：主色 accent、徽章底色 soft、描边 line、外发光 glow、光晕 aura（克制但有层次）
     if (isHigh) {
         title = L"勒索行为已拦截";
@@ -316,10 +326,14 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
                     L"这可能是 bootkit 正在建立开机持久化，建议「恢复引导」；磁盘工具的合法改动请选「信任此变更」。";
         accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
         glow = L"rgba(255,77,87,.28)"; aura = L"rgba(255,77,87,.16)";
-    } else if (isProc || isRegrun || isLanded) {
-        title = isProc    ? L"可疑行为已自动拦截"
-              : isRegrun  ? L"可疑自启动项已自动拦截"
-                          : L"落地载荷已自动隔离";
+    } else if (isProc || isRegrun || isLanded || isHashLanded) {
+        // 标题必须让用户一眼分清「确凿」与「疑似」：
+        //   hashlanded → 「已知恶意样本」= 已与病毒库比对一致，不存在"可能误判"的余地
+        //   landed     → 「落地载荷」    = 靠目录 + 形态推断出来的可疑
+        title = isProc        ? L"可疑行为已自动拦截"
+              : isRegrun      ? L"可疑自启动项已自动拦截"
+              : isHashLanded  ? L"已知恶意样本已自动隔离"
+                              : L"落地载荷已自动隔离";
         sub   = L"<span id=\"alSub\">正在获取事件详情…</span>";
         accent = L"#ff4d57"; soft = L"rgba(255,77,87,.14)"; line = L"rgba(255,77,87,.32)";
         glow = L"rgba(255,77,87,.28)"; aura = L"rgba(255,77,87,.16)";
@@ -341,7 +355,15 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
     }
     // 三种状态的线性图标（描边，随状态色 currentColor 着色），比色块/emoji 更有质感
     std::wstring icon;
-    if (isHigh || isSuspect || isAutoKill || status == "infected") {
+    if (isHashLanded) {
+        // 病毒库命中的**确凿**恶意 → 盾牌 + 叉；与「形态可疑」的盾牌 + 感叹号形成
+        // 一眼可辨的区别（同 viewBox / 同描边风格，不破坏卡片设计统一性）。
+        icon = L"<svg viewBox=\"0 0 24 24\" width=\"26\" height=\"26\" fill=\"none\" stroke=\"currentColor\" "
+               L"stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
+               L"<path d=\"M12 2l8 3v6c0 5-3.4 8.6-8 11-4.6-2.4-8-6-8-11V5l8-3z\"/>"
+               L"<line x1=\"9.4\" y1=\"9.4\" x2=\"14.6\" y2=\"14.6\"/>"
+               L"<line x1=\"14.6\" y1=\"9.4\" x2=\"9.4\" y2=\"14.6\"/></svg>";
+    } else if (isHigh || isSuspect || isAutoKill || status == "infected") {
         icon = L"<svg viewBox=\"0 0 24 24\" width=\"26\" height=\"26\" fill=\"none\" stroke=\"currentColor\" "
                L"stroke-width=\"2\" stroke-linecap=\"round\" stroke-linejoin=\"round\">"
                L"<path d=\"M12 2l8 3v6c0 5-3.4 8.6-8 11-4.6-2.4-8-6-8-11V5l8-3z\"/>"
@@ -402,8 +424,9 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
         action = L"<div class=\"btns\">"
                  L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
                  L"</div>";
-    } else if (isRegrun || isLanded) {
-        // 自启动移除 / 落地隔离：可撤销（统一走 undo: 管道 → 服务按 token 前缀分发）
+    } else if (isRegrun || isLanded || isHashLanded) {
+        // 自启动移除 / 落地隔离（含病毒库命中隔离）：可撤销
+        //（统一走 undo: 管道 → 服务按 token 前缀分发，30 = 隔离区还原）
         action = L"<div class=\"btns\">"
                  L"<div class=\"btn ghost\" onclick=\"window.chrome.webview.postMessage('close')\">知道了</div>"
                  L"<div class=\"btn warn\" id=\"undoBtn\" onclick=\"doUndo()\">撤销我的处理</div>"
@@ -415,7 +438,7 @@ std::wstring BuildHtml(const std::string& status, int score, const std::wstring&
     // 撤销按钮的二次确认脚本：把按钮换成"确认态"，3 秒无操作自动还原。
     // 2026-09-19 扩展：引导拦截卡（撤销拦截）/ 自启动移除 / 落地隔离都复用同一脚本，
     // 统一走 undo:<token> 管道 → 服务按 token 前缀分发（10=引导 20=自启 30=隔离）。
-    const bool needsUndoJs = (isHigh || isSuspect || (isBoot && g_rolledBack) || isRegrun || isLanded);
+    const bool needsUndoJs = (isHigh || isSuspect || (isBoot && g_rolledBack) || isRegrun || isLanded || isHashLanded);
     std::wstring undoJs;
     if (needsUndoJs) {
         const std::wstring confirmTxt = isSuspect ? L"确认还原？" : (isBoot ? L"确认撤销拦截？" : L"确认撤销？");
@@ -1142,26 +1165,63 @@ static bool SpawnInUserSession(HANDLE hToken, const std::wstring& cmd) {
     return ok != FALSE;
 }
 
+// ---------------------------------------------------------------------------
+//  ★ 弹窗宿主选择（2026-09-21）：优先 Electron，失败回退 WebView2
+//
+//  背景：告警卡原本由本进程以 WebView2 渲染（main.cpp 的 --toast 分支）。
+//  银泊指定改为独立 Electron 程序（无边框/不可缩放/不可移动/无托盘/只能由服务调起），
+//  但同时要求**保留 WebView2 作为回退** —— 万一 Electron 运行时缺失或启动失败，
+//  告警不能就此消失（告警是主防唯一能被用户看见的出口，静默失败后果严重）。
+//
+//  判定顺序：
+//    ① 找 dist\toast\SilverFoxToast.exe（与主防服务同目录的相对路径）
+//    ② 存在则用服务自己的进程令牌在用户会话里拉起它（与旧路径完全相同的会话注入）
+//    ③ 拉起失败或文件不存在 → 回退旧 WebView2 路径（--toast）
+//
+//  注意：Electron 版的 UI 进程**不做任何防护动作**，全部经命名管道回到服务执行，
+//  所以它跑在用户会话是安全的（不给它任何特权，它也无从提权）。
+// ---------------------------------------------------------------------------
+static std::wstring SvcDirW() {
+    wchar_t exepath[MAX_PATH] = {0};
+    GetModuleFileNameW(nullptr, exepath, MAX_PATH);
+    std::wstring p = exepath;
+    size_t slash = p.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? std::wstring() : p.substr(0, slash);
+}
+
+static std::wstring ElectronToastPathW() {
+    std::wstring dir = SvcDirW();
+    if (dir.empty()) return std::wstring();
+    // ★ 两个候选布局都要试（2026-09-23 修）：
+    //   此前只查 `toast\` 子目录，而实际安装位把 SilverFoxToast.exe 放在**根目录**
+    //   （与 SilverFoxGuardSvc.exe 同级）→ 一直静默回退 WebView2，
+    //   用户看到的弹窗始终是旧 WebView2 卡（银泊实拍发现）。
+    //   ① <INSTDIR>\toast\SilverFoxToast.exe —— 安装器把 toast.7z 解到 $INSTDIR\toast
+    //   ② <INSTDIR>\SilverFoxToast.exe       —— 平铺布局（当前安装位就是这个）
+    const wchar_t* kCands[] = { L"\\toast\\SilverFoxToast.exe", L"\\SilverFoxToast.exe" };
+    for (const wchar_t* c : kCands) {
+        std::wstring p = dir + c;
+        DWORD attr = GetFileAttributesW(p.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return p;
+    }
+    return std::wstring();
+}
+
 void NotifyAnomaly(const std::string& status, int score,
                    const std::string& risk, const std::string& undoToken, bool rolledBack) {
-    wchar_t exepath[MAX_PATH];
-    GetModuleFileNameW(nullptr, exepath, MAX_PATH);
-    std::wstring cmd = std::wstring(L"\"") + exepath + L"\" --toast --status=" + U8W(status)
-                       + L" --score=" + std::to_wstring(score);
     // 撤销凭据经命令行传递：token 由引擎生成，字符集是 [0-9a-f]，无引号/空格风险。
     // 这里仍做一次白名单过滤——命令行是外部可写边界（任何进程都能带同名参数拉起本
     // 程序），若把任意字符串原样透传给服务，等于开了一个"诱导主防执行 undo"的口子。
-    if (!risk.empty())      cmd += L" --risk=" + U8W(risk);
-    if (rolledBack)         cmd += L" --rolledback=1";
+    // ★ Electron 与 WebView2 两条路径共用这份过滤结果，避免只改一处漏掉另一处。
+    std::string safeToken;
     if (!undoToken.empty()) {
-        std::string safe;
         for (char c : undoToken) {
             bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-            if (hex && safe.size() < 32) safe.push_back(c);
+            if (hex && safeToken.size() < 32) safeToken.push_back(c);
         }
-        if (!safe.empty()) cmd += L" --undo=" + U8W(safe);
     }
 
+    // ---- 定位活动会话（两条路径都需要）----
     DWORD sid = WTS_CURRENT_SESSION;
     bool found = false;
     PWTS_SESSION_INFOW pInfo = nullptr; DWORD count = 0;
@@ -1174,11 +1234,239 @@ void NotifyAnomaly(const std::string& status, int score,
     { wchar_t b[128]; swprintf_s(b, L"[notify] found=%d sessionId=%d\r\n", (int)found, (int)sid); WriteDbg(b); }
 
     HANDLE hToken = found ? GetUserTokenForSession(sid) : nullptr;
+
+    // ---- ① 优先 Electron ----
+    //
+    // ★ 参数格式（2026-09-21 实测定型，改动前务必读这段）
+    //
+    //  Electron 启动时 Chromium 会先自己解析一遍命令行。实测（Electron 24）：
+    //      SilverFoxToast.exe --status=infected
+    //  **不会**报错，但整条 `--status=…` 被 Chromium 静默吞掉，参数进不去 JS；
+    //  主进程照常启动却拿不到 status，于是走"非法调起"分支立刻退出 ——
+    //  表现是「窗口闪一下就没了 / 压根没反应」，比直接报错难查得多。
+    //  WebView2 无此限制（参数一直这么传），所以从 WebView2 迁过来时极易踩中。
+    //
+    //  正确写法：用 `--` 把 payload 推到 Chromium 解析范围之外，
+    //  多个键值用 `;` 分隔：
+    //      SilverFoxToast.exe -- sfx=status=infected;score=200;risk=landed;undo=30ab…;rolledback=1
+    //  解析侧见 toast-app/resources/app/main.js 的 parseArgs()。
+    //
+    //  ★ 排查提醒：若在"父进程本身是 Electron/Node"的终端里（WorkBuddy / VS Code 等）
+    //  手工试跑，环境里会带 `ELECTRON_RUN_AS_NODE=1`，Electron 退化成纯 Node.js，
+    //  于是报 `bad option:` / `Cannot find module '…\sfx=…'`、`--version` 打出 Node 版本号。
+    //  那是终端环境的锅，不是打包或代码问题 —— 服务经 CreateEnvironmentBlock 构造
+    //  用户环境块调起时不存在该变量。main.js 顶部已加显式检测便于日后一眼定位。
+    //
+    //  为什么值里不用引号：status 只可能是 normal/warning/infected，
+    //  risk 是固定的几个短标识，score 是数字，undo 已过 [0-9a-f] 白名单，
+    //  rolledback 是 0/1 —— 全部是命令行安全字符，无需转义，
+    //  也就自然没有引号注入面（这是刻意保持的，不要为了"通用"去支持任意字符串）。
+    std::wstring elPath = ElectronToastPathW();
+    if (!elPath.empty()) {
+        std::wstring payload = L"sfx=status=" + U8W(status)
+                             + L";score=" + std::to_wstring(score);
+        if (!risk.empty())          payload += L";risk=" + U8W(risk);
+        if (rolledBack)             payload += L";rolledback=1";
+        if (!safeToken.empty())     payload += L";undo=" + U8W(safeToken);
+
+        // 注意 `--` 与 payload 之间的空格 —— 这是让 Chromium 停止解析的关键
+        std::wstring cmd = L"\"" + elPath + L"\" -- " + payload;
+
+        if (SpawnInUserSession(hToken, cmd)) {
+            WriteDbg(L"[notify] 已拉起 Electron 告警卡（用户会话）\r\n");
+            if (hToken) CloseHandle(hToken);
+            return;
+        }
+        // 拉起失败：不 return，继续走回退路径 —— 告警绝不能因为 UI 换宿主而丢失
+        WriteDbg(L"[notify] Electron 拉起失败，回退 WebView2 路径\r\n");
+    } else {
+        WriteDbg(L"[notify] 未找到 SilverFoxToast.exe（已试 toast\\ 子目录与根目录），使用 WebView2 路径\r\n");
+    }
+
+    // ---- ② 回退：旧 WebView2 路径（与本函数原实现完全一致）----
+    wchar_t exepath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exepath, MAX_PATH);
+    std::wstring cmd = std::wstring(L"\"") + exepath + L"\" --toast --status=" + U8W(status)
+                       + L" --score=" + std::to_wstring(score);
+    if (!risk.empty())              cmd += L" --risk=" + U8W(risk);
+    if (rolledBack)                 cmd += L" --rolledback=1";
+    if (!safeToken.empty())         cmd += L" --undo=" + U8W(safeToken);
+
     bool ok = SpawnInUserSession(hToken, cmd);
     if (ok) WriteDbg(L"[notify] 已拉起 toast（用户环境块 + winsta0\\default）\r\n");
     else    WriteDbg(L"[notify] 拉起 toast 失败\r\n");
     if (hToken) CloseHandle(hToken);
 }
+
+// ---------------------------------------------------------------------------
+//  ★ 沙箱弹窗（2026-09-27）：进度卡 + 结果卡
+//
+//  与 NotifyAnomaly 同一跨会话拉起机制（Electron 优先），但**只走 Electron 路径**：
+//    · 沙箱卡是「进度告知 / 分析结果」性质，不像勒索告警那样不容有失；
+//    · WebView2 回退卡（BuildHtml）的分支表里没有沙箱状态，硬塞会渲染成
+//      「环境已恢复正常」—— 错误信息比没信息更糟，故 Electron 缺失时记日志跳过。
+//
+//  ★ payload 编码（与 main.js 的约定，改动前先读 toast-app/.../main.js parseArgs）：
+//    parseArgs 按 ';' 切键值对、按 '=' 切键值。file / summary 是外部文本
+//    （文件名 / 沙箱行为摘要，可能含空格、中文甚至 ';''='），必须先 URL 编码
+//    再拼进 sfx=，JS 侧 decodeURIComponent 还原 —— 否则摘要里的分号会伪造
+//    出第二个键（命令行注入面）。
+// ---------------------------------------------------------------------------
+static std::string UrlEncodeSfx(const std::string& s) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    for (unsigned char c : s) {
+        bool safe = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                    (c >= 'a' && c <= 'z') || c == '-' || c == '_' ||
+                    c == '.' || c == '~';
+        if (safe) out.push_back((char)c);
+        else { out.push_back('%'); out.push_back(hex[c >> 4]); out.push_back(hex[c & 0xF]); }
+    }
+    return out;
+}
+
+static void SpawnSandboxCard(const std::string& payloadTail) {
+    // ---- 定位活动会话（与 NotifyAnomaly 同一逻辑）----
+    DWORD sid = WTS_CURRENT_SESSION;
+    bool found = false;
+    PWTS_SESSION_INFOW pInfo = nullptr; DWORD count = 0;
+    if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pInfo, &count)) {
+        for (DWORD i = 0; i < count; ++i) {
+            if (pInfo[i].State == WTSActive) { sid = pInfo[i].SessionId; found = true; break; }
+        }
+        WTSFreeMemory(pInfo);
+    }
+    HANDLE hToken = found ? GetUserTokenForSession(sid) : nullptr;
+
+    std::wstring elPath = ElectronToastPathW();
+    if (elPath.empty()) {
+        WriteDbg(L"[sandbox] 未找到 SilverFoxToast.exe，沙箱弹窗跳过"
+                 L"（无 WebView2 回退：回退卡无沙箱分支，会渲染成误导文案）\r\n");
+        if (hToken) CloseHandle(hToken);
+        return;
+    }
+    // payloadTail 是纯 ASCII（URL 编码后），U8W 安全
+    std::wstring payload = L"sfx=" + U8W(payloadTail);
+    std::wstring cmd = L"\"" + elPath + L"\" -- " + payload;
+    if (SpawnInUserSession(hToken, cmd))
+        WriteDbg(L"[sandbox] 已拉起沙箱卡片（用户会话）\r\n");
+    else
+        WriteDbg(L"[sandbox] 拉起沙箱卡片失败\r\n");
+    if (hToken) CloseHandle(hToken);
+}
+
+// 哨兵文件：结果卡发出时由服务写入（更新 mtime）。前端进度卡轮询其 mtime，
+// 一旦发现"结果已出"就自行关闭 —— 解决「进度卡倒计时挂很久不消失」的问题。
+// 背景：每张卡都是经 SpawnInUserSession 拉起的**独立 Electron 进程**，彼此无共享
+// 状态，进度卡无法被结果卡直接关闭，只能靠这个跨进程信号协调。读不到（权限/不存在）
+// 时进度卡按自身寿命自然关闭，属优雅降级，不会出错。
+// 进度卡：「可疑文件正在送进沙箱检测，预计还剩 N 秒」。
+// etaSec 由调用方按文件类型/体积估算（当前统一 30s，判定策略讨论后可细化）。
+// ★★ 2026-10-02 修复：哨兵必须「每轮先删、由结果卡重建」，不能让服务端留着旧文件。
+//
+//   症状（银泊实测）：判定结果早就出来了，进度卡仍卡在「分析即将完成，正在生成报告…」，
+//   必须手动关掉。
+//
+//   根因**不是**前端漏写哨兵 —— main.js 的 did-finish-load 分支里这段代码是有的。
+//   问题是它写不进去，而且两条路都写不进去：
+//     · 本目录（C:\ProgramData\SilverFoxGuard）的继承 ACE 对**文件**只给 Users:(RX)；
+//       那条 (WD,AD,WEA,WA) 带 CI 标志，只作用于**子目录**、不作用于文件。
+//     · 文件 owner 是谁都不影响 —— 权限来自 ACL，不是天然特权。
+//   实测（以用户身份）：touch 既有哨兵 → Permission denied；新建文件 → 成功。
+//   ⇒ 结果卡进程（用户会话）utimesSync 与 writeFileSync 双双 EACCES，被前端两层
+//     catch 静默吞掉，**却仍打印 'result sentinel touched'（假绿日志）**。
+//   ⇒ 进度卡 statSync 到的 mtime 永远停在旧值，判据 `mtimeMs > cardStart` 恒假，
+//     只能等 main.js 的 5 分钟寿命兜底 —— 用户看到的就是"卡住不消失"。
+//
+//   修法：利用上面那个**不对称性**（用户能建、不能改）—— 服务端以 LocalSystem 身份
+//   （对本目录有 F）在每轮拉起进度卡**之前**删掉哨兵；随后结果卡渲染完成时走
+//   writeFileSync **新建**（创建只需目录的 WD 权限，必然成功），进度卡便能在 1 秒内
+//   看到"刚刚"的时间戳并自行关闭。删除失败只留痕、不阻断（退回寿命兜底）。
+//
+//   ⚠️ 路径与前端 main.js 的 SENTINEL 常量必须**字面一致**，改一处必须改两处。
+static void ResetSandboxResultSentinel() {
+    const wchar_t* kSentinel = L"C:\\ProgramData\\SilverFoxGuard\\sb_result.sentinel";
+    if (DeleteFileW(kSentinel)) {
+        WriteDbg(L"[sandbox] 已清结果哨兵（本轮结果卡渲染完成后重建，用于关闭进度卡）\r\n");
+        return;
+    }
+    const DWORD e = GetLastError();
+    // FILE/PATH_NOT_FOUND 是正常路径（上一轮已清干净 / 首次运行），不算故障。
+    if (e != ERROR_FILE_NOT_FOUND && e != ERROR_PATH_NOT_FOUND) {
+        WriteDbg(L"[sandbox] ⚠ 清结果哨兵失败（err=" + std::to_wstring((unsigned long long)e) +
+                 L"）→ 本轮进度卡可能只能靠寿命兜底关闭\r\n");
+    }
+}
+
+void NotifySandboxProgress(const std::string& file, int etaSec) {
+    if (etaSec <= 0) etaSec = 30;
+    if (etaSec > 600) etaSec = 600;   // 上限 10 分钟：估算失真也不许卡片挂半天
+    ResetSandboxResultSentinel();
+    SpawnSandboxCard("status=sandbox_progress;eta=" + std::to_string(etaSec)
+                   + ";file=" + UrlEncodeSfx(file));
+}
+
+// 结果卡：verdict = malicious / suspicious / clean / error / not_applicable。
+void NotifySandboxResult(const std::string& file, const std::string& verdict,
+                         int score, const std::string& summary,
+                         const std::string& errToken, int errLeftSec) {
+    // verdict 白名单（外部可写边界 —— 来自管道的字符串不可信，必须收敛到枚举）。
+    //
+    // ★★ 2026-10-01 修正：白名单必须包含 error / not_applicable。
+    //   旧版只认三个值，其余**一律降级成 suspicious** —— 于是 sandbox 传来的
+    //   "not_applicable"（沙箱不适用于此文件，如压缩包里没有可执行载荷）和
+    //   "error"（沙箱没分析成）都被渲染成**琥珀色「可疑程序」**。
+    //   把"没看清"说成"看着可疑"是**纯误报**，而且和另一种错法（渲染层把所有
+    //   非恶意/可疑值都归成绿色「未发现威胁」）方向正好相反 ——
+    //   一个假阳性、一个假阴性，同一个"瞎猜"来源。
+    //
+    //   未知值改降级到 "error" 而不是 "suspicious"：`error` 是**免责声明**，
+    //   `suspicious` 是**指控**。分不清的时候不许指控别人。
+    std::string v = verdict;
+    if (v != "malicious" && v != "suspicious" && v != "clean" &&
+        v != "error" && v != "not_applicable") {
+        v = "error";
+    }
+    if (score < 0)   score = 0;
+    // ★★ 2026-10-03（B3）：静默钳制改为**可观测**。
+    //   【原状】`if (score > 200) score = 200;` 悄悄把分数压到 200，
+    //   界面上「很严重」与「极严重」长得一模一样，而**日志里一个字都没有** ——
+    //   又一次「拿不到就悄悄处理」（铁律 46 同族）。
+    //   【为什么仍要钳制】下游解析（index.html deriveFlags / main.js parseArgs）
+    //   的量程是 0~200，超出会显示异常。所以钳制本身要留，只是不许「静默」。
+    //   【改法】钳制时打一行（节流到每次调用一条，因为这个函数每次沙箱结束才调一次，
+    //   量级可忽略），并把**原始分**一并带出，供排查核对。
+    // ★★ 无结论决策凭据（2026-10-03）：令牌 + 剩余秒数。
+    //   只在 errToken 非空时带上（其余档位的 payload 保持原样，零影响）。
+    //   ⚠️ 令牌**必须**经 URL 编码：它是服务端生成的 hex，虽只含 [0-9a-f]，
+    //   但把"外部给的值直接拼进命令行样式字符串"本身就是坏习惯 ——
+    //   一旦将来换成含分隔符的字符，会直接破坏参数解析（半通故障家族）。
+    std::string tokPart;
+    if (!errToken.empty()) {
+        tokPart = ";errtoken=" + UrlEncodeSfx(errToken)
+                + ";errleft=" + std::to_string(errLeftSec > 0 ? errLeftSec : 0);
+    }
+    if (score > 200) {
+        const int raw = score;
+        score = 200;
+        LogDbgC((std::string("[toast] 沙箱结果分 ") + std::to_string(raw) +
+                  " 超出下游量程 0~200，已钳制为 200（下游 deriveFlags/parseArgs 不支持更大值）")
+                     .c_str());
+        SpawnSandboxCard("status=sandbox_result;verdict=" + v
+                       + ";score=" + std::to_string(score)
+                       + ";file=" + UrlEncodeSfx(file)
+                       + ";summary=" + UrlEncodeSfx(summary)
+                       + tokPart
+                       + ";rawscore=" + std::to_string(raw));
+        return;
+    }
+    SpawnSandboxCard("status=sandbox_result;verdict=" + v
+                   + ";score=" + std::to_string(score)
+                   + ";file=" + UrlEncodeSfx(file)
+                   + ";summary=" + UrlEncodeSfx(summary)
+                   + tokPart);
+}
+
 int RunToast(const std::string& status, int score,
              const std::string& risk, const std::string& undoToken, bool rolledBack) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -1188,7 +1476,10 @@ int RunToast(const std::string& status, int score,
     g_theme = GetSystemTheme();
     g_currentStatus = status;   // 记住当前状态/评分，确认卡取消后回渲染
     g_currentScore  = score;
-    g_risk = U8W(risk);   // risk 只有 "high"/"suspect" 两种取值，纯 ASCII，UTF-8/ANSI 一致
+    // risk 全部是固定的短 ASCII 标识（high/suspect/mbr/proc/regrun/landed/hashlanded），
+    // 无引号无空格 —— 这是刻意保持的，可安全直接拼进命令行，不存在转义/注入面。
+    // ★ 新增 risk 值时必须同步三处白名单：main.js:parseArgs、preload.js、本文件 BuildHtml。
+    g_risk = U8W(risk);
     g_undoToken = undoToken;
     g_rolledBack = rolledBack;
     g_html = BuildHtml(status, score, g_theme);

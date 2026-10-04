@@ -12,8 +12,8 @@ int main(int argc, char** argv) {
     fflush(stdout);
     RunFullScan();
     printf("\n=== 结果 ===\n");
-    printf("status = %s   score = %d   findings = %zu\n",
-           g_result.status.c_str(), g_result.score, g_result.findings.size());
+    printf("status = %s   score = %d   findings = %zu   selfCheck = %d\n",
+           g_result.status.c_str(), g_result.score, g_result.findings.size(), (int)g_result.selfCheck);
     std::map<std::string, int> byTitle;
     for (const auto& f : g_result.findings) byTitle[f.category + "/" + f.severity + "/" + f.title]++;
     printf("\n--- 发现项分布 ---\n");

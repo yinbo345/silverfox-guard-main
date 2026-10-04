@@ -163,6 +163,43 @@ inline constexpr unsigned short C2_PORTS[] = {
 };
 inline constexpr std::size_t C2_PORTS_N = sizeof(C2_PORTS) / sizeof(C2_PORTS[0]);
 
+// ---- ★★ 挖矿矿池常用端口（2026-10-03 新增，Win10 真样本实测补的洞）----
+//  为什么必须单独一张表、不能并进 C2_PORTS：
+//    语义完全不同。`C2_PORTS` 命中 = **铁证级**（配合 C2_IP 抬到 level 2 / score 200），
+//    是「已知恶意基础设施」；矿池端口 = **可疑旁证**（7777 上跑着的不一定是矿，
+//    可能有正常服务），单凭端口不能定罪。
+//    并进去会让「连 7777 就终止」这种过宽处置落地 ⇒ 误杀面直接爆开。
+//    ⇒ 端口只做**旁证**，必须与进程自身可疑（命令行/路径/信誉/行为判据）**叠加**才升级。
+//
+//  实证代价（2026-10-03 Win10 虚拟机真样本那一轮）：挖矿进程 CPU 100% 烧了一整轮，
+//  主防**零告警**。根因链有两环，这一环是其中之一：
+//    ① `service.cpp` 的 `if (!hitIp && !hitPort) return;`
+//       ⇒ 矿池地址不在那 13 条 IP 里 ⇒ **连接事件当场丢弃，连一行日志都不打**
+//       （铁律 24「哑巴兜底」：什么都不打 ⇒ 排障时是黑洞）；
+//    ② 上一环的 netwatch 哑巴兜底（已修：60s 启动宽限 + 超窗判不健康）。
+//  修完这一环，仍要靠 CPU 监控（正在做）才能兜住「不连已知矿池」的变种。
+inline constexpr unsigned short MINER_PORTS[] = {
+    3333,   // stratum 经典端口
+    4444,
+    5555,
+    7777,   // 门罗币 cryptonight 主力矿池端口
+    8888,
+    14444,  // 以太坊 stratum
+    45700,  // nanopool / monero
+    45560,  // P2Pool / monero
+    3334, 3335, 4443, 5556, 5566, 7778, 8899,  // 变体
+};
+inline constexpr std::size_t MINER_PORTS_N = sizeof(MINER_PORTS) / sizeof(MINER_PORTS[0]);
+
+// 矿池协议特征串（命令行的形态判据；与端口互为佐证）
+inline constexpr const char* MINER_PROTO_TOKENS[] = {
+    "stratum+tcp", "stratum+ssl", "xmrig", "cpuminer", "minerd", "ethminer",
+    "nbminer", "phoenixminer", "lolminer", "t-rex", "nanominer", "gminer",
+    "cryptonight", "randomx", "rx/0", "donate-level", "nicehash",
+};
+inline constexpr std::size_t MINER_PROTO_TOKENS_N =
+    sizeof(MINER_PROTO_TOKENS) / sizeof(MINER_PROTO_TOKENS[0]);
+
 // ---- 注册表持久化位置（检查 Run / RunOnce / AppInit / IFEO）----
 inline constexpr const char* REG_RUN_KEYS[] = {
     "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
@@ -172,6 +209,96 @@ inline constexpr const char* REG_RUN_KEYS[] = {
     "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows",  // AppInit_DLLs 在此
 };
 inline constexpr std::size_t REG_RUN_KEYS_N = sizeof(REG_RUN_KEYS) / sizeof(REG_RUN_KEYS[0]);
+
+// ---- ★ IFEO（Image File Execution Options）劫持（2026-09-20 新增）----
+// 主界面「扫描覆盖面」卡片自 v1.2 起就写着「注册表：自启动项 / IFEO 劫持 / 浏览器策略」，
+// 但代码里**一行 IFEO 都没有**（grep "ifeo|Image File Execution|Debugger" 零命中）。
+// 这是典型的"文案先行、实现缺席"——卡片在替程序吹牛。此处把它做成真的。
+//
+// 攻击原理：HKLM\...\Image File Execution Options\<某个exe> 下写一个 Debugger 值，
+// 系统在启动该 exe 时会先运行 Debugger 指定的程序（原本这是给调试器用的）。
+// 银狐/各类木马常用缺口（2026 年仍活跃）：
+//   · 劫持 sethc.exe / utilman.exe / osk.exe / magnify.exe / narrator.exe
+//     → 锁屏界面上按 Shift×5 / Win+U 即可拉出 SYSTEM 权限的任意程序（"粘滞键后门"）
+//   · 劫持 taskmgr.exe / cmd.exe → 用户点任务管理器实际启动攻击者程序
+//   · 劫持 msiexec.exe / svchost.exe → 更隐蔽的常驻
+//
+// 判定原则（避免误报）：
+//   ① Debugger 值的路径必须指向**用户可写区域**（AppData / Temp / Users\Public /
+//      ProgramData / Downloads）→ 正常软件绝不会把调试器指向这些地方；
+//   ② 或指向不存在的文件（已被清理的残留劫持）；
+//   ③ 若 Debugger 指向 Program Files / Windows 下的正常调试器路径，只记日志不报警。
+inline constexpr const char* IFEO_KEY = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options";
+// 最值得盯的被劫持宿主（值名固定为 "Debugger"）
+inline constexpr const char* IFEO_HOT_TARGETS[] = {
+    "sethc.exe",      // 粘滞键 —— 锁屏界面 Shift×5 拉出
+    "utilman.exe",    // 轻松访问 —— 锁屏界面 Win+U 拉出
+    "osk.exe",        // 屏幕键盘
+    "magnify.exe",    // 放大镜
+    "narrator.exe",   // 讲述人
+    "displayswitch.exe",
+    "atbroker.exe",
+    "taskmgr.exe",    // 任务管理器
+    "cmd.exe",
+    "powershell.exe",
+    "explorer.exe",
+    "svchost.exe",
+    "msiexec.exe",
+    "rundll32.exe",
+    "regedit.exe",
+    "mmc.exe",
+    "control.exe",
+};
+inline constexpr std::size_t IFEO_HOT_TARGETS_N = sizeof(IFEO_HOT_TARGETS) / sizeof(IFEO_HOT_TARGETS[0]);
+
+// 用户可写区域片段：Debugger 指向这里 = 几乎确定是劫持
+inline constexpr const char* USER_WRITABLE_HINTS[] = {
+    "\\appdata\\", "\\temp\\", "\\users\\public\\", "\\programdata\\",
+    "\\downloads\\", "\\desktop\\", "\\documents\\", "\\$recycle.bin\\",
+    "\\windows\\temp\\", "\\roaming\\", "\\local\\microsoft\\windows\\inetcache\\",
+};
+inline constexpr std::size_t USER_WRITABLE_HINTS_N = sizeof(USER_WRITABLE_HINTS) / sizeof(USER_WRITABLE_HINTS[0]);
+
+// ---- ★ 浏览器策略劫持（2026-09-20 新增）----
+// 同样是卡片里早就写了、代码里没有的能力。
+// 攻击原理：Chrome/Edge 会读取注册表 Policies\...\ 下的强制策略，
+// 木马借此静默安装自己的扩展、改主页/搜索引擎、把攻击者证书装进信任列表。
+// 这些策略**用户无法在浏览器界面里改回去**（会显示"由贵单位管理"），
+// 是银狐一类木马维持浏览器驻留的常见手段。
+//
+// 判定原则：策略键下的值是不是"指向外部可写路径/陌生 URL"，而不是有策略就报——
+// 企业环境（域策略）下存在策略属正常，全部报警会淹没真实发现。
+inline constexpr const char* BROWSER_POLICY_KEYS[] = {
+    "SOFTWARE\\Policies\\Google\\Chrome",
+    "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionInstallForcelist",
+    "SOFTWARE\\Policies\\Google\\Chrome\\ExtensionSettings",
+    "SOFTWARE\\Policies\\Microsoft\\Edge",
+    "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionInstallForcelist",
+    "SOFTWARE\\Policies\\Microsoft\\Edge\\ExtensionSettings",
+    "SOFTWARE\\Policies\\Mozilla\\Firefox",
+};
+inline constexpr std::size_t BROWSER_POLICY_KEYS_N = sizeof(BROWSER_POLICY_KEYS) / sizeof(BROWSER_POLICY_KEYS[0]);
+
+// 强制安装扩展列表（ExtensionInstallForcelist 的每个值就是一条扩展 ID）——
+// 这些值意味着"用户在浏览器里看不到、也删不掉"的扩展
+inline constexpr const char* BROWSER_FORCE_EXT_VALUE = "1";   // 值名从 1 开始编号
+
+// 浏览器主页/搜索劫持值名
+inline constexpr const char* BROWSER_HIJACK_VALUES[] = {
+    "HomepageLocation",
+    "HomepageIsNewTabPage",
+    "NewTabPageLocation",
+    "RestoreOnStartup",
+    "RestoreOnStartupURLs",
+    "DefaultSearchProviderSearchURL",
+    "DefaultSearchProviderName",
+    "ProxyMode",
+    "ProxyServer",
+    "ProxyPacUrl",
+    "AuthServerWhitelist",           // 把凭据送去攻击者服务器
+    "SSLErrorOverrideAllowed",       // 允许忽略证书错误
+};
+inline constexpr std::size_t BROWSER_HIJACK_VALUES_N = sizeof(BROWSER_HIJACK_VALUES) / sizeof(BROWSER_HIJACK_VALUES[0]);
 
 // 注册表值名/数据中需警惕的片段
 // 注：已移除 "silverfox"——那是安全厂商给木马家族起的代号，真实样本不会自称 silverfox，

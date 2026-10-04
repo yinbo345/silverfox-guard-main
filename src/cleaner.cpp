@@ -33,6 +33,7 @@ namespace fs = std::filesystem;
 #include "cleaner.h"
 #include "common.h"
 #include "scanner.h"
+#include "sideload.h"   // 白加黑（DLL 侧加载）检测，2026-09-22
 
 #pragma comment(lib, "psapi.lib")
 
@@ -484,12 +485,19 @@ static std::string DirN(const std::string& p) {
 }
 
 // 短随机名判定（与 scanner.cpp 同规则）：5~9 位字母数字、字母数字混合、含数字穿插
+// ★ 2026-09-20 修正：原实现只剥离 4 字符后缀（.exe/.dll/.sys/...），导致
+//   3 字符扩展名的随机名脚本（.ps1 / .py / .scr / .bat）因「基名+后缀」整体超长
+//   而被判否 —— 但 CollectDerivatives 的扩展名白名单里明明收了它们，
+//   结果是「枚举到但清不掉」。现按「取最后一个点之后为后缀」统一处理，
+//   并把后缀白名单与 CollectDerivatives 对齐。
 static bool ShortRand(const std::string& fname) {
     std::string s = fname;
-    if (s.size() >= 4) {
-        std::string ext = to_lower(s.substr(s.size() - 4));
-        if (ext == ".exe" || ext == ".dll" || ext == ".sys" || ext == ".dat" ||
-            ext == ".tmp" || ext == ".bin" || ext == ".js" || ext == ".vbs") s = s.substr(0, s.size() - 4);
+    size_t dot = s.rfind('.');
+    if (dot != std::string::npos && dot > 0 && s.size() - dot <= 5) {
+        static const char* kStrip[] = {".exe", ".dll", ".sys", ".dat", ".tmp", ".bin",
+                                       ".js", ".vbs", ".ps1", ".py", ".scr", ".bat", ".cmd"};
+        std::string ext = to_lower(s.substr(dot));
+        for (const char* e : kStrip) if (ext == e) { s = s.substr(0, dot); break; }
     }
     size_t n = s.size();
     if (n < 5 || n > 9) return false;
@@ -504,6 +512,99 @@ static bool ShortRand(const std::string& fname) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+//  ★ 绝不清理路径白名单（2026-09-20 新增）—— 衍生物清除的最后一道保险
+//
+//  为什么必须存在：衍生物的判据是「短随机名 + 可执行扩展名」，扫描范围包含
+//  ProgramData / Temp / Downloads / Users\Public。**游戏反作弊恰好符合这个画像**：
+//    · EasyAntiCheat   → C:\ProgramData\EasyAntiCheat\ 下释放随机名组件
+//    · BattlEye        → C:\Program Files (x86)\Common Files\BattlEye\ <目录>
+//    · ACE / 腾讯反作弊 → C:\Program Files\AntiCheatExpert\ <目录>
+//    · Vanguard(无畏契约) → C:\Program Files\Riot Vanguard\ <目录>
+//
+//  ⚠️ 上面几行的**行尾不能以反斜杠结尾** —— MSVC 的行拼接在注释里同样生效，
+//     写成 `...BattlEye\` 会把下一行注释接上来一起被注释掉，
+//     连带后面的注释块结构全乱（铁律 41 同族）。
+//  这些目录一旦被按名字扫掉，后果是「游戏起不来」——用户会立刻卸载我们，
+//  比漏报一个银狐严重得多。故此处采用**目录级白名单硬拦截**，
+//  命中即跳过，不进入任何删除流程（连枚举结果都不给）。
+//
+//  白名单维度（任一命中即保护）：
+//    ① 系统目录：\Windows\、\System32\、\SysWOW64\、\WinSxS\、\$Recycle.Bin 除外
+//    ② 程序安装目录：\Program Files\、\Program Files (x86)\ —— 正常软件都装这里，
+//       反作弊也大量安装在这里；银狐从不用这些位置释放载荷（写不进去），
+//       所以整体排除不会有检测损失
+//    ③ 反作弊 / 游戏平台专用目录（关键词匹配，覆盖国内外主流）
+//    ④ 我方程序自身目录（自保，已有 IsSelfPath 兜底，这里再做一层）
+//    ⑤ 用户自定义信任目录（由 service.cpp 写入全局列表）
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_userTrustDirs;   // 小写、带前后分隔符的安全目录
+static std::mutex              g_trustMtx;
+
+// 供 service.cpp 登记用户信任目录（如「这是我自己写的程序目录，别动」）
+void AddNeverCleanDir(const std::string& dir) {
+    if (dir.size() < 4) return;
+    std::string d = to_lower(dir);
+    for (auto& c : d) if (c == '/') c = '\\';
+    if (d.back() != '\\') d += '\\';
+    std::lock_guard<std::mutex> lk(g_trustMtx);
+    for (const auto& e : g_userTrustDirs) if (e == d) return;
+    g_userTrustDirs.push_back(d);
+    LogDbg("[clean-safe] 已登记信任目录: " + d);
+}
+
+bool IsNeverCleanPath(const std::string& path) {
+    if (path.empty()) return true;                 // 空路径绝不处理
+    std::string lp = to_lower(path);
+    for (auto& c : lp) if (c == '/') c = '\\';
+
+    // ① 系统目录（注意 \$recycle.bin 是清理目标，不能进白名单）
+    static const char* kSysDirs[] = {
+        "\\windows\\", "\\winsxs\\", "\\system volume information\\",
+        "\\$windows.~bt\\", "\\$windows.~ws\\",
+    };
+    for (const char* d : kSysDirs) if (lp.find(d) != std::string::npos) return true;
+
+    // ② 程序安装目录：银狐无法向这里释放载荷（缺写权限），故整体保护，
+    //    同时天然覆盖装在 Program Files 下的反作弊 / 游戏平台。
+    //    ⚠️ 例外：若路径**同时**位于用户可写的高发区（见下），说明是畸形路径，不豁免。
+    if (lp.find("\\program files\\") != std::string::npos ||
+        lp.find("\\program files (x86)\\") != std::string::npos) {
+        if (lp.find("\\appdata\\") == std::string::npos &&
+            lp.find("\\temp\\") == std::string::npos) return true;
+    }
+
+    // ③ 反作弊 / 游戏平台专用目录（关键词，覆盖国内外主流反作弊）
+    //    这些目录可能不在 Program Files 下（如 EAC 用 ProgramData、BattlEye 用 ProgramData），
+    //    必须单独列出，否则就是误删现场。
+    static const char* kAntiCheatDirs[] = {
+        // 国际反作弊
+        "\\easyanticheat", "\\easy anti-cheat", "\\battleye", "\\riot vanguard",
+        "\\vgk", "\\vanguard", "\\equ8", "\\xigncode", "\\nprotect",
+        "\\fairfight", "\\faceit", "\\esea", "\\punkbuster", "\\gameguard",
+        "\\denuvo", "\\arbiter", "\\mhyprot", "\\anti-cheat", "\\anticheat",
+        // 国内反作弊 / 平台
+        "\\anticheatexpert", "\\ace-guard", "\\ace\\", "\\tenprotect",
+        "\\tenio", "\\tencent\\tp", "\\sguard", "\\腾讯游戏", "\\tp3helper",
+        "\\netease", "\\易盾", "\\yuanqi", "\\antiprotect",
+        // 游戏平台
+        "\\steamapps\\", "\\steam\\", "\\epic games\\", "\\ubisoft", "\\origin",
+        "\\ea games\\", "\\battle.net\\", "\\blizzard", "\\gog galaxy\\",
+        "\\riot games\\", "\\wegame", "\\warframe", "\\rockstar",
+    };
+    for (const char* d : kAntiCheatDirs) if (lp.find(d) != std::string::npos) return true;
+
+    // ④ 我方程序自身目录
+    if (IsSelfPath(path)) return true;
+
+    // ⑤ 用户自定义信任目录
+    {
+        std::lock_guard<std::mutex> lk(g_trustMtx);
+        for (const auto& d : g_userTrustDirs) if (lp.rfind(d, 0) == 0) return true;
+    }
+    return false;
+}
+
 // 衍生物收集：不仅收【目标同目录】的随机名载荷，还扫【跨目录高发区】——
 // 银狐常在 %TEMP%、AppData\Roaming、Users\Public、各盘 Downloads、ProgramData 里
 // 释放多份副本/伴生 DLL，只清样本所在目录会漏（重启后副本可再拉起）。
@@ -513,6 +614,7 @@ static void CollectDerivatives(const std::vector<std::string>& targets, std::vec
     for (const auto& t : targets) seen.insert(to_lower(t));
     auto isDeriv = [&](const std::string& p) -> bool {
         std::string lp = to_lower(p);
+        if (IsNeverCleanPath(p)) return false;   // ★ 白名单硬拦截（反作弊/系统/Program Files）
         if (IsSelfPath(p)) return false;
         if (seen.count(lp)) return false;
         std::string base = BaseN(lp);
@@ -542,6 +644,34 @@ static void CollectDerivatives(const std::vector<std::string>& targets, std::vec
     for (const auto& t : targets) {
         std::string d = DirN(t);
         if (!d.empty()) scanDir(d, 0);
+    }
+
+    // ①b ★ 白加黑：从每个 PE 目标的导入表找同目录的恶意侧加载 DLL（2026-09-22）
+    //
+    //  为什么单列一步：上面 isDeriv 的判据是 ShortRand（短随机名），
+    //  而侧加载 DLL 的**名字是正常的**（version.dll / libcurl.dll / sqlite3.dll）——
+    //  它们永远不会命中随机名判据，于是整个白加黑形态在清除链上是空白的。
+    //  唯一能发现它们的入口是读宿主 exe 的导入表：它声明了"我会加载哪些 DLL"。
+    //
+    //  ⚠️ 只在**实时处置链**（本函数）走这一步，不进全盘扫描的逐文件路径 ——
+    //     sideload::Find 内部会做 WinVerifyTrust 签名校验，逐文件调用开销会累积。
+    //     这里每个样本只跑一次，且只有"同目录真的存在该 DLL"时才验签，开销可忽略。
+    for (const auto& t : targets) {
+        std::string tl = to_lower(t);
+        bool peLike = ci_ends_with(tl, ".exe") || ci_ends_with(tl, ".dll") || ci_ends_with(tl, ".sys");
+        if (!peLike) continue;                    // 非 PE 没有导入表，跳过
+        std::vector<sf::sideload::Finding> fs = sf::sideload::Find(t);
+        for (const auto& f : fs) {
+            if (f.level < 1) continue;            // 档 0 = 不报（sideload 内部已过滤，双保险）
+            if (IsNeverCleanPath(f.dllPath)) continue;   // 反作弊/系统/Program Files 硬拦截
+            if (IsSelfPath(f.dllPath)) continue;
+            std::string lp = to_lower(f.dllPath);
+            if (seen.count(lp)) continue;         // 已被 scanDir 收过则不重复
+            out.push_back(f.dllPath);
+            seen.insert(lp);
+            LogDbg("[sideload] 纳入清除清单 level=" + std::to_string(f.level) +
+                   "：" + f.dllPath + " host=" + f.hostExe);
+        }
     }
     // ② 跨目录高发区（所有固定盘）
     DWORD drives = GetLogicalDrives();
@@ -990,6 +1120,99 @@ CleanReport AdvancedCleanFiles(const std::vector<std::string>& targetsIn) {
     CleanPersistenceFor(targets);
     WriteCleanProgress("done", (int)targets.size(), (int)targets.size(), "");
     return rep;
+}
+
+// ---------------------------------------------------------------------------
+//  ★ 衍生物定点清除（2026-09-20 新增）——实时拦截联动专用
+//
+//  触发场景（三条实时路径）：
+//    · WmiSink：进程被判高危并已 TerminateProcess → 清它释放/召唤出来的伴生文件
+//    · LandedAlertWatch：落地载荷已隔离 → 清同批落地的其它副本
+//    · RegRunWatch：可疑自启动项已移除 → 清它指向的载荷本体
+//
+//  与 AdvancedCleanFiles 的差别（刻意做得更保守）：
+//    · 不杀进程（调用方已处置；此处只处理文件，避免实时路径里再掀进程树）
+//    · 有文件数上限（默认 24），防止实时路径被海量枚举拖住
+//    · 全程白名单（IsNeverCleanPath）+ 自保 + 目标去重
+//    · 单文件失败就跳过，不升级为「重启登记删除」——重启登记是重武器，
+//      实时路径里误登记一个正常文件的后果是用户下次开机发现文件没了且无从追溯
+//
+//  删除策略：先 TryDeleteOnce（轻量，能删掉就用它）；删不掉说明被占用，
+//            此时**不硬删**（硬删会解 ACL + 夺权，风险面大），只跳过并记原因。
+//            真正的顽固文件留给用户显式点「一键清除 / 高级清除」去处理。
+//            这样实时路径永远是「安全可撤销」的，不会自作主张扩大破坏面。
+// ---------------------------------------------------------------------------
+int SweepDerivatives(const std::vector<std::string>& seedPaths,
+                     CleanReport* outReport, bool dryRun) {
+    const size_t kMaxFiles = 24;   // 实时路径硬上限
+    int removed = 0;
+
+    if (seedPaths.empty()) return 0;
+
+    // 种子路径净化：只保留非空、非白名单、非自保的
+    std::vector<std::string> seeds;
+    for (const auto& s : seedPaths) {
+        if (s.empty()) continue;
+        if (IsNeverCleanPath(s) || IsSelfPath(s)) continue;
+        seeds.push_back(s);
+    }
+    if (seeds.empty()) return 0;
+
+    // 收集衍生物（CollectDerivatives 内部已做白名单 + 自保 + 去重）
+    std::vector<std::string> deriv;
+    try { CollectDerivatives(seeds, deriv); } catch (...) { return 0; }
+    if (deriv.empty()) return 0;
+
+    // 再兜一层上限（CollectDerivatives 可能一次收很多）
+    std::vector<std::string> todo;
+    for (const auto& d : deriv) {
+        if (todo.size() >= kMaxFiles) break;
+        if (IsNeverCleanPath(d) || IsSelfPath(d)) continue;   // 双保险
+        todo.push_back(d);
+    }
+    if (todo.empty()) return 0;
+
+    CleanReport rep;
+    rep.requested = (int)todo.size();
+
+    for (const auto& p : todo) {
+        CleanItemResult it; it.path = p;
+        if (dryRun) {
+            it.action = "skipped";
+            it.reason = "干跑模式：仅枚举，未删除";
+            ++rep.skipped;
+            rep.items.push_back(it);
+            continue;
+        }
+        if (GetFileAttributesA(p.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            it.action = "deleted";
+            it.reason = "衍生物已不存在";
+            ++rep.deleted; ++removed;
+            rep.items.push_back(it);
+            continue;
+        }
+        if (TryDeleteOnce(p)) {
+            it.action = "deleted";
+            it.reason = "已清除衍生物（同批释放的随机名载荷）";
+            ++rep.deleted; ++removed;
+            rep.items.push_back(it);
+            LogDbg("[deriv] 已清除衍生物: " + p);
+            continue;
+        }
+        // 被占用 → 实时路径**不硬删**（避免解 ACL / 夺权扩大破坏面），跳过等用户显式清除
+        it.action = "failed";
+        it.reason = "文件被占用，已跳过（如需强制清除请在主界面点「一键清除」）";
+        ++rep.failed;
+        rep.items.push_back(it);
+        LogDbg("[deriv] 衍生物删除失败（被占用，跳过）: " + p);
+    }
+
+    if (outReport) *outReport = rep;
+    if (removed > 0)
+        LogDbg("[deriv] 本轮衍生物清除完成：requested=" + std::to_string(rep.requested) +
+               " deleted=" + std::to_string(rep.deleted) +
+               " failed=" + std::to_string(rep.failed));
+    return removed;
 }
 
 // 是否属于「可清除的强样本类」：只清理乱码（随机名）文件、双后缀诱饵、已知路径/标记样本，

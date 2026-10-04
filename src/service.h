@@ -10,6 +10,7 @@ void RunService();
 // 安装 / 卸载（需管理员 / SYSTEM 权限）
 bool SvcInstall();
 bool SvcUninstall();
+bool EnsureServiceRegistered();   // 自保：若服务被删除则重建
 
 // 查询后台服务是否已在运行（RUNNING / START_PENDING）
 bool IsServiceRunning();
@@ -28,5 +29,12 @@ void PipeServerThread();
 // 停止信号
 void RequestStop();
 bool IsStopRequested();
+
+// 停止事件句柄（可等待对象，可能为空 —— 见 sfstop.h 的说明）
+HANDLE StopHandle();
+
+// 清除"引导告警活跃"标志（用户在引导告警卡上做出了选择后调用）。
+// 供 mod_boot 分体使用 —— 分体不直接触碰服务层的静态状态。
+void ClearBootAlertActive();
 
 }  // namespace sf

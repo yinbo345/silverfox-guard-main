@@ -293,44 +293,34 @@ static void OnWebMessage(const std::string& msg) {
     }
 
     // ---- 轻活：同步取回（服务端直接返回缓存，毫秒级）----
-    if (cmd == "history") {
-        PipeRequest("{\"cmd\":\"history\"}", resp);
-        PushToJs(resp);
-    } else if (cmd == "rollbackstatus") {
-        PipeRequest("{\"cmd\":\"rollbackstatus\"}", resp);
-        PushToJs(resp);
-    } else if (cmd == "rollbacklist") {
-        PipeRequest("{\"cmd\":\"rollbacklist\"}", resp);
+    if (cmd == "status") {
+        // 启动 / 30 秒轮询的热路径：保持**同步**取回（服务端直接返回缓存，毫秒级），
+        // 不必为一个线程调度多绕一圈。
+        PipeRequest("{\"cmd\":\"status\"}", resp);
         PushToJs(resp);
     } else if (cmd == "gpuget") {
-        // 前端同时要「开关状态」与「地图详情」：先给开关，再给一次进度帧
-        std::string js = "window.__gpuState && window.__gpuState(" + std::string(compute::IsGpuEnabled() ? "true" : "false") + ");";
+        // 这一条**不能**靠兜底：它除了解析开关，还要在本地把状态直接推给前端
+        // （__gpuState），并顺带补一次地图进度帧 —— 属于"有本地副作用"的命令。
+        std::string js = "window.__gpuState && window.__gpuState(" +
+                         std::string(compute::IsGpuEnabled() ? "true" : "false") + ");";
         if (g_wv) g_wv->ExecuteScript(U8W(js).c_str(), nullptr);
         if (compute::IsGpuEnabled()) {
             PipeRequest("{\"cmd\":\"gpuprog\"}", resp);
             PushToJs(resp);
         }
-    } else if (cmd == "status") {
-        PipeRequest("{\"cmd\":\"status\"}", resp);
-        PushToJs(resp);
-    } else if (cmd == "keylist") {
-        // 密钥库列表（截获的勒索密钥副本）
-        PipeRequest("{\"cmd\":\"keylist\"}", resp);
-        PushToJs(resp);
-    } else if (cmd == "keyread") {
-        // 读取某条密钥的十六进制全文；index 越界由服务端归 0
-        long idx = JsonGetInt(msg, "index");
-        if (idx < 0) idx = 0;
-        PipeRequest(std::string("{\"cmd\":\"keyread\",\"index\":") + std::to_string(idx) + "}", resp);
-        PushToJs(resp);
-    } else if (cmd == "keyclear") {
-        // 清空密钥库（仅删副本，不碰原始文件）
-        PipeRequest("{\"cmd\":\"keyclear\"}", resp);
-        PushToJs(resp);
-    } else if (cmd == "landlist") {
-        // 落地前置捕获命中记录（取走即清空队列）
-        PipeRequest("{\"cmd\":\"landlist\"}", resp);
-        PushToJs(resp);
+    } else if (!cmd.empty()) {
+        // ---- ★ 兜底：原样转发给服务端（2026-09-22 主干式架构）----
+        //  改造前：未在此登记的 cmd 会被**静默丢弃** —— 这正是"新增管道命令要
+        //  改两处，漏一处就是管道能通、GUI 点了没反应"那个最难查的半通故障来源。
+        //
+        //  现在改为原样转发：服务端按**分体清单**（见 module.h / modules_list.cpp）
+        //  查表分发，认不出的走服务端自己的兜底（返回当前扫描结果）。
+        //  于是分体新增命令时，GUI 侧**零改动** —— 这是"加功能只改 1 处"的 GUI 侧半边。
+        //
+        //  ⚠️ 用 RequestAsync（后台线程）而非同步 PipeRequest：
+        //    分体命令可能是重活（扫描 / 清除 / 全盘复查），在 UI 线程同步等会冻住窗口。
+        //  ⚠️ 空 cmd 不转发：那类消息（无 cmd 字段）本就不该有响应。
+        RequestAsync(msg.c_str());
     }
 }
 
